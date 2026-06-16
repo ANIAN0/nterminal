@@ -39,3 +39,28 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# PoC data files
+data/
+
+# PoC logs
+logs/
+
+# PoC ad-hoc dev/test logs at repo root
+dev-server.*.log
+observe-server.*.log
+wterm-*-smoke.*.log
+wterm-debug-smoke.*.log
+
+wterm-debug-smoke.err.log
+wterm-debug-smoke.log
+wterm-smoke-server.err.log
+wterm-smoke-server.log
+wterm-submit-smoke.err.log
+wterm-submit-smoke.log
+
+vitest.config.mjs
+skills-lock.json
+workplace
+.agents
+.claude

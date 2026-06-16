@@ -1,26 +1,317 @@
 @import "tailwindcss";
+@import "@wterm/react/css";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+/* ------------------------------------------------------------------
+ * 设计 token —— 参考 warp 默认深色 + wterm 默认主题
+ * 全站 dark-first：终端面板是视觉主角，UI chrome 都是深色玻璃质感
+ * Tailwind v4 必须用 @theme 声明 CSS 变量，否则会被 preflight 吞掉
+ * ------------------------------------------------------------------ */
+@theme {
+  /* 暖调 ANSI（仅 UI chrome 使用；终端内 ANSI 由 wterm 提供） */
+  --color-bg-base: #0b0c10;
+  --color-bg-elev-1: #11131a;
+  --color-bg-elev-2: #181b24;
+  --color-bg-panel: rgba(24, 27, 36, 0.72);
+  --color-bg-panel-strong: rgba(17, 19, 26, 0.92);
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
+  --color-border-subtle: rgba(255, 255, 255, 0.06);
+  --color-border-strong: rgba(255, 255, 255, 0.12);
+
+  --color-fg-primary: #f5f5f7;
+  --color-fg-secondary: #b8bcc7;
+  --color-fg-tertiary: #6b7080;
+  --color-fg-quaternary: #4a4e5c;
+
+  --color-accent: #a5d5fe;
+  --color-accent-2: #d6fcb9;
+  --color-accent-warn: #fefdc2;
+  --color-accent-danger: #ff8272;
+
+  --color-status-running: #6affb4;
+  --color-status-connecting: #fefdc2;
+  --color-status-idle: #6b7080;
+  --color-status-error: #ff8272;
+
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+/* 给 body / 全局元素用的非颜色 token（如阴影），放 :root 里没问题，
+   因为它们不参与 Tailwind 工具类生成 */
+:root {
+  color-scheme: dark;
+  --shadow-card:
+    0 1px 0 rgba(255, 255, 255, 0.04) inset,
+    0 8px 24px rgba(0, 0, 0, 0.45),
+    0 2px 6px rgba(0, 0, 0, 0.35);
+  --shadow-term:
+    0 1px 0 rgba(255, 255, 255, 0.05) inset,
+    0 20px 60px rgba(0, 0, 0, 0.55),
+    0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+html,
+body {
+  height: 100%;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background-color: var(--color-bg-base);
+  background-image:
+    radial-gradient(
+      1100px 600px at 12% -10%,
+      rgba(255, 130, 114, 0.06),
+      transparent 60%
+    ),
+    radial-gradient(
+      900px 500px at 110% 10%,
+      rgba(165, 213, 254, 0.06),
+      transparent 60%
+    ),
+    radial-gradient(
+      800px 800px at 50% 120%,
+      rgba(106, 255, 180, 0.04),
+      transparent 60%
+    );
+  color: var(--color-fg-primary);
+  font-family: var(--font-geist-sans), system-ui, -apple-system, "Segoe UI",
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* ------------------------------------------------------------------
+ * 终端外壳 —— 把 wterm 内容放进一个真正的 "terminal 卡片"
+ * wterm 自带的 .wterm 已有自己的 padding/bg/shadow；这里让它适配
+ * 外层 flex 容器 + 加边框 + 高度自适应
+ * ------------------------------------------------------------------ */
+.poc-terminal {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: #0d0e12;
+  border-radius: 12px;
+  border: 1px solid var(--color-border-strong);
+  box-shadow: var(--shadow-term);
+  overflow: hidden;
+}
+
+.poc-terminal > .wterm {
+  flex: 1;
+  border-radius: 0;
+  box-shadow: none;
+  border: 0;
+  padding: 14px 16px;
+  background: transparent;
+  --term-font-family: var(--font-geist-mono), "Cascadia Mono", "JetBrains Mono",
+    "Menlo", "Consolas", monospace;
+  --term-font-size: 13.5px;
+  --term-line-height: 1.35;
+  --term-row-height: 18px;
+}
+
+.poc-terminal:focus,
+.poc-terminal:focus-visible {
+  outline: none;
+}
+
+/* ------------------------------------------------------------------
+ * 滚动条 —— 深色风格
+ * ------------------------------------------------------------------ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+  background-clip: padding-box;
+}
+
+/* ------------------------------------------------------------------
+ * 复用 UI 元素
+ * ------------------------------------------------------------------ */
+@layer components {
+  .glass-panel {
+    background-color: rgba(24, 27, 36, 0.72);
+    border: 1px solid var(--color-border-subtle);
+    border-radius: 10px;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+  }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.25rem 0.6rem;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--color-border-subtle);
+    color: var(--color-fg-secondary);
+    line-height: 1;
+  }
+
+  .pill .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: currentColor;
+    box-shadow: 0 0 0 0 currentColor;
+  }
+
+  .pill.running {
+    color: var(--color-status-running);
+    border-color: rgba(106, 255, 180, 0.35);
+    background: rgba(106, 255, 180, 0.08);
+  }
+  .pill.connecting {
+    color: var(--color-status-connecting);
+    border-color: rgba(254, 253, 194, 0.35);
+    background: rgba(254, 253, 194, 0.08);
+  }
+  .pill.connecting .dot {
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  .pill.idle {
+    color: var(--color-fg-tertiary);
+  }
+  .pill.error {
+    color: var(--color-status-error);
+    border-color: rgba(255, 130, 114, 0.35);
+    background: rgba(255, 130, 114, 0.08);
+  }
+
+  .mono {
+    font-family: var(--font-geist-mono), "Cascadia Mono", "Menlo", "Consolas",
+      monospace;
+    font-feature-settings: "liga" 0, "calt" 1;
+  }
+
+  .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    padding: 0.55rem 1rem;
+    font-size: 13px;
+    font-weight: 500;
+    color: #0b0c10;
+    background: linear-gradient(180deg, #d6fcb9 0%, #a8e69c 100%);
+    border: 1px solid rgba(106, 255, 180, 0.5);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: transform 0.08s ease, box-shadow 0.12s ease, filter 0.12s ease;
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.4) inset,
+      0 1px 2px rgba(0, 0, 0, 0.3);
+  }
+  .btn-primary:hover:not(:disabled) {
+    filter: brightness(1.05);
+  }
+  .btn-primary:active:not(:disabled) {
+    transform: translateY(1px);
+  }
+  .btn-primary:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  .btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    padding: 0.5rem 0.9rem;
+    font-size: 13px;
+    color: var(--color-fg-secondary);
+    background: transparent;
+    border: 1px solid var(--color-border-subtle);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.12s ease, border-color 0.12s ease,
+      color 0.12s ease;
+  }
+  .btn-ghost:hover {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: var(--color-border-strong);
+    color: var(--color-fg-primary);
+  }
+
+  .input-mono {
+    width: 100%;
+    padding: 0.75rem 1rem;
+    font-family: var(--font-geist-mono), "Cascadia Mono", monospace;
+    font-size: 14px;
+    color: var(--color-fg-primary);
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid var(--color-border-subtle);
+    border-radius: 10px;
+    outline: none;
+    transition: border-color 0.12s ease, box-shadow 0.12s ease,
+      background 0.12s ease;
+  }
+  .input-mono::placeholder {
+    color: var(--color-fg-quaternary);
+  }
+  .input-mono:focus {
+    border-color: rgba(165, 213, 254, 0.55);
+    box-shadow: 0 0 0 3px rgba(165, 213, 254, 0.15);
+    background: rgba(0, 0, 0, 0.5);
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.15rem 0.5rem;
+    font-size: 11px;
+    color: var(--color-fg-secondary);
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--color-border-subtle);
+    border-radius: 999px;
+    line-height: 1.4;
+  }
+
+  .nav-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.4rem 0.7rem;
+    font-size: 12.5px;
+    color: var(--color-fg-secondary);
+    border-radius: 6px;
+    transition: background 0.12s ease, color 0.12s ease;
+  }
+  .nav-link:hover {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--color-fg-primary);
+  }
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(254, 253, 194, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(254, 253, 194, 0);
+  }
 }
