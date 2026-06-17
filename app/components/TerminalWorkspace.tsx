@@ -23,6 +23,16 @@ function isPrintable(ch: string): boolean {
   return ch >= ' ' && ch !== '\x1b' && ch !== '\x7f';
 }
 
+function looksLikeJsonEnvelope(s: string): boolean {
+  if (!s.startsWith('{') || s.length > 2000) return false;
+  try {
+    const obj = JSON.parse(s);
+    return obj != null && typeof obj === 'object' && (typeof obj.type === 'string' || typeof obj._ctrl === 'object');
+  } catch {
+    return false;
+  }
+}
+
 export default function TerminalWorkspace({ sessionId }: { sessionId: string }) {
   const router = useRouter();
   const terminalRef = useRef<{ write?: (data: string) => void } | null>(null);
@@ -64,6 +74,7 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
     ws.onmessage = async (ev) => {
       const data = ev.data;
       if (typeof data === 'string') {
+        if (looksLikeJsonEnvelope(data)) return;
         terminalRef.current?.write?.(data);
         return;
       }

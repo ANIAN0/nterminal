@@ -11,7 +11,8 @@ import { join } from 'node:path';
 import { parse } from 'node:url';
 import next from 'next';
 import { WebSocket, WebSocketServer } from 'ws';
-import { stripAnsi, normalizeVisibleText, makePreview } from './server/text-utils.mjs';
+import { normalizeVisibleText, makePreview } from './server/text-utils.mjs';
+import { createOsc133Parser } from './server/osc-parser.mjs';
 
 import {
   addSessionListener,
@@ -50,6 +51,7 @@ const LOG_DIR = join(process.cwd(), 'logs');
 const DEBUG_LOG_FILE = join(LOG_DIR, 'wterm-poc-debug.log');
 const VERBOSE_LOG = process.env.POC_VERBOSE_LOG === '1';
 const REPLY_IDLE_MS = parseInt(process.env.POC_REPLY_IDLE_MS || '1800', 10);
+const OSC_DEBOUNCE_MS = 200;
 
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
@@ -116,6 +118,8 @@ function createObserver(sessionId, ws, sessionMeta) {
     hasUserMessage: false,
     recordId: null,
     recordFinalized: false,
+    oscParser: createOsc133Parser(),
+    oscDetected: false,
   };
 }
 
@@ -138,6 +142,14 @@ function finalizeRecord(observer, endState, error = null) {
 }
 
 function observeInput(observer, input) {
+  if (observer.oscDetected) {
+    for (const char of input) {
+      if (char === '\r' || char === '\n') {
+        flushUserMessage(observer);
+      }
+    }
+    return;
+  }
   for (const char of input) {
     if (char === '\r' || char === '\n') {
       flushUserMessage(observer);
@@ -154,8 +166,13 @@ function observeInput(observer, input) {
 }
 
 function flushUserMessage(observer) {
-  const text = observer.userBuffer.trim();
-  observer.userBuffer = '';
+  let text;
+  if (observer.oscDetected) {
+    text = '(input via TUI)';
+  } else {
+    text = observer.userBuffer.trim();
+    observer.userBuffer = '';
+  }
   if (!text) return;
 
   // 收敛前一个未结束的 record
@@ -176,24 +193,31 @@ function flushUserMessage(observer) {
   observer.recordId = recordId;
   observer.recordFinalized = false;
 
-  const payload = {
-    type: 'user_message',
-    sessionId: observer.sessionId,
-    text,
-    recordId,
-    bytes: Buffer.byteLength(text, 'utf-8'),
-  };
-  writeLog('user_message', payload);
-  sendWs(observer.ws, payload, 'user_message', false);
+  writeLog('user_message', { type: 'user_message', sessionId: observer.sessionId, text, recordId, bytes: Buffer.byteLength(text, 'utf-8') });
 }
 
 function observeOutput(observer, output) {
   if (!observer.hasUserMessage) return;
   observer.replyBuffer += output;
-  if (observer.replyTimer) clearTimeout(observer.replyTimer);
-  observer.replyTimer = setTimeout(() => flushAgentReply(observer), REPLY_IDLE_MS);
 
-  // 同步把 raw output 追加到当前 record
+  const events = observer.oscParser.feed(output);
+  for (const e of events) {
+    if (e.type === 'mark') {
+      if (!observer.oscDetected) {
+        observer.oscDetected = true;
+      }
+      if (e.mark === 'C') {
+        if (observer.replyTimer) clearTimeout(observer.replyTimer);
+        observer.replyTimer = setTimeout(() => flushAgentReply(observer), OSC_DEBOUNCE_MS);
+      }
+    }
+  }
+
+  if (!observer.oscDetected) {
+    if (observer.replyTimer) clearTimeout(observer.replyTimer);
+    observer.replyTimer = setTimeout(() => flushAgentReply(observer), REPLY_IDLE_MS);
+  }
+
   const recordId = activeRecords.get(observer.sessionId);
   if (recordId) {
     try { appendOutput(recordId, output); }
@@ -212,14 +236,7 @@ function flushAgentReply(observer) {
   observer.replyBuffer = '';
   if (!text) return;
 
-  const payload = {
-    type: 'agent_reply',
-    sessionId: observer.sessionId,
-    text,
-    bytes: Buffer.byteLength(text, 'utf-8'),
-  };
-  writeLog('agent_reply', payload);
-  sendWs(observer.ws, payload, 'agent_reply', false);
+  writeLog('agent_reply', { type: 'agent_reply', sessionId: observer.sessionId, text, bytes: Buffer.byteLength(text, 'utf-8') });
 
   // 关闭当前 record
   finalizeRecord(observer, 'idle', null);
@@ -488,7 +505,6 @@ function bindPtyWebSocket(ws, sessionId) {
   const sessionMeta = getSession(sessionId);
   const observer = createObserver(sessionId, ws, sessionMeta);
   sessionObservers.set(sessionId, observer);
-  sendWs(ws, { type: 'ready', sessionId }, 'ready');
 
   const ptyListener = (event) => {
     if (event.type === 'data') {
@@ -507,12 +523,9 @@ function bindPtyWebSocket(ws, sessionId) {
       flushAgentReply(observer);
       finalizeRecord(observer, 'session_exit', 'pty_exit');
       writeLog('session_exit', { sessionId, exitCode: event.exitCode, signal: event.signal });
-      sendWs(ws, {
-        type: 'session_exit',
-        sessionId,
-        exitCode: event.exitCode,
-        signal: event.signal,
-      }, 'session_exit');
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(`\r\n\x1b[90m[session exited (code ${event.exitCode})]\x1b[0m\r\n`);
+      }
     }
   };
 
@@ -534,7 +547,6 @@ function bindPtyWebSocket(ws, sessionId) {
       writeRawInput(ws, sessionId, input.text, input.bytes);
     } catch (err) {
       writeLog('ws_message_error', { sessionId, message: err instanceof Error ? err.message : String(err) });
-      sendWsError(ws, 'message_error', '消息处理错误');
     }
   });
 
@@ -570,7 +582,7 @@ function maybeHandleControlMessage(ws, sessionId, text) {
   if (ctrl.type === 'resize') {
     const ok = resize(sessionId, ctrl.cols, ctrl.rows);
     verboseLog('resize', { sessionId, cols: ctrl.cols, rows: ctrl.rows, ok });
-    if (!ok) sendWsError(ws, 'resize_failed', '调整终端大小失败');
+    if (!ok) writeLog('resize_failed', { sessionId, cols: ctrl.cols, rows: ctrl.rows });
     return true;
   }
   return false;
@@ -580,16 +592,7 @@ function writeRawInput(ws, sessionId, input, bytes) {
   const ok = writeToSession(sessionId, input);
   if (!ok) {
     writeLog('pty_write_failed', { sessionId, bytes, input: makePreview(input, 'user') });
-    sendWsError(ws, 'pty_write_failed', '写入 PTY 失败');
   }
 }
 
-function sendWs(ws, payload, eventName, verbose = true) {
-  if (verbose) verboseLog('ws_send', { eventName, payload });
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
-}
 
-function sendWsError(ws, code, message) {
-  sendWs(ws, { type: 'error', code, message }, `error.${code}`, false);
-  writeLog('ws_error_sent', { code, message });
-}
