@@ -11,8 +11,8 @@ import { join } from 'node:path';
 import { parse } from 'node:url';
 import next from 'next';
 import { WebSocket, WebSocketServer } from 'ws';
-import { normalizeVisibleText, makePreview } from './server/text-utils.mjs';
-import { createOsc133Parser } from './server/osc-parser.mjs';
+import { makePreview } from './server/text-utils.mjs';
+import { createTerminalObserver } from './server/terminal-observer.mjs';
 
 import {
   addSessionListener,
@@ -51,7 +51,8 @@ const LOG_DIR = join(process.cwd(), 'logs');
 const DEBUG_LOG_FILE = join(LOG_DIR, 'wterm-poc-debug.log');
 const VERBOSE_LOG = process.env.POC_VERBOSE_LOG === '1';
 const REPLY_IDLE_MS = parseInt(process.env.POC_REPLY_IDLE_MS || '1800', 10);
-const OSC_DEBOUNCE_MS = 200;
+const OSC_DEBOUNCE_MS = parseInt(process.env.POC_OSC_DEBOUNCE_MS || '300', 10);
+const OSC_STALE_MS = parseInt(process.env.POC_OSC_STALE_MS || '5000', 10);
 
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
@@ -107,20 +108,29 @@ async function readJsonBody(req) {
 }
 
 function createObserver(sessionId, ws, sessionMeta) {
-  return {
+  // P1b：terminal-observer 持有 turn 状态机（OSC 133 + 去抖 + alt-screen 隔离）。
+  // onFinalize 回调在回复 finalize 时触发（OSC 去抖或 idle 兜底），录 agent_reply + finishTurn。
+  // 用 observer 闭包延迟绑定（terminal 需要 onFinalize，onFinalize 需要 observer）。
+  const observer = {
     sessionId,
     ws,
     cwd: sessionMeta?.cwd || '',
     command: sessionMeta?.command || '',
     userBuffer: '',
-    replyBuffer: '',
-    replyTimer: null,
     hasUserMessage: false,
     recordId: null,
     recordFinalized: false,
-    oscParser: createOsc133Parser(),
-    oscDetected: false,
+    terminal: null,
   };
+  observer.terminal = createTerminalObserver({
+    cols: 80,
+    rows: 24,
+    idleMs: REPLY_IDLE_MS,
+    debounceMs: OSC_DEBOUNCE_MS,
+    staleMs: OSC_STALE_MS,
+    onFinalize: (text, reason) => onReplyFinalize(observer, text, reason),
+  });
+  return observer;
 }
 
 function finalizeRecord(observer, endState, error = null) {
@@ -142,14 +152,9 @@ function finalizeRecord(observer, endState, error = null) {
 }
 
 function observeInput(observer, input) {
-  if (observer.oscDetected) {
-    for (const char of input) {
-      if (char === '\r' || char === '\n') {
-        flushUserMessage(observer);
-      }
-    }
-    return;
-  }
+  // P1b：不再用 oscDetected 分支。用户输入字符即 prompt 文本（pi raw 模式不回显，
+  // 但 observeInput 看到的是 client→PTY 的原始按键），直接捕获为 user 文本。
+  // 过滤控制/转义序列，处理退格。role 标注的难点在 assistant 回复侧（P1d），与 user 输入无关。
   for (const char of input) {
     if (char === '\r' || char === '\n') {
       flushUserMessage(observer);
@@ -166,13 +171,8 @@ function observeInput(observer, input) {
 }
 
 function flushUserMessage(observer) {
-  let text;
-  if (observer.oscDetected) {
-    text = '(input via TUI)';
-  } else {
-    text = observer.userBuffer.trim();
-    observer.userBuffer = '';
-  }
+  const text = observer.userBuffer.trim();
+  observer.userBuffer = '';
   if (!text) return;
 
   // 收敛前一个未结束的 record
@@ -181,7 +181,6 @@ function flushUserMessage(observer) {
   }
 
   observer.hasUserMessage = true;
-  observer.replyBuffer = '';
 
   const recordId = beginTurn({
     sessionId: observer.sessionId,
@@ -193,31 +192,20 @@ function flushUserMessage(observer) {
   observer.recordId = recordId;
   observer.recordFinalized = false;
 
+  // P1b：开新 turn，复位 OSC 计数（aCount/zoneStart），告知 terminal-observer 等待回复 finalize。
+  observer.terminal.setHasUserTurn(true);
+
   writeLog('user_message', { type: 'user_message', sessionId: observer.sessionId, text, recordId, bytes: Buffer.byteLength(text, 'utf-8') });
 }
 
 function observeOutput(observer, output) {
+  // PTY 输出旁路喂 headless grid（差分渲染可见文本还原 + OSC 133 turn 状态机）。
+  // 不论 hasUserMessage 都喂，保证 grid 始终与真实终端同步（resize/重绘/alt-screen 都要进 grid）。
+  observer.terminal.feed(output);
+
   if (!observer.hasUserMessage) return;
-  observer.replyBuffer += output;
 
-  const events = observer.oscParser.feed(output);
-  for (const e of events) {
-    if (e.type === 'mark') {
-      if (!observer.oscDetected) {
-        observer.oscDetected = true;
-      }
-      if (e.mark === 'C') {
-        if (observer.replyTimer) clearTimeout(observer.replyTimer);
-        observer.replyTimer = setTimeout(() => flushAgentReply(observer), OSC_DEBOUNCE_MS);
-      }
-    }
-  }
-
-  if (!observer.oscDetected) {
-    if (observer.replyTimer) clearTimeout(observer.replyTimer);
-    observer.replyTimer = setTimeout(() => flushAgentReply(observer), REPLY_IDLE_MS);
-  }
-
+  // appendOutput 保留原始字节供搜索/重放；可见文本还原走 grid snapshot，不依赖此内容。
   const recordId = activeRecords.get(observer.sessionId);
   if (recordId) {
     try { appendOutput(recordId, output); }
@@ -227,20 +215,28 @@ function observeOutput(observer, output) {
   }
 }
 
-function flushAgentReply(observer) {
-  if (observer.replyTimer) {
-    clearTimeout(observer.replyTimer);
-    observer.replyTimer = null;
+// P1b/P1e：terminal-observer 在回复 finalize（OSC 去抖或 idle 兜底）时回调此函数。
+// payload = { assistantText, userTextFromOsc, role }。
+//   - assistantText：grid snapshot 还原的回复可见文本（录 agent_reply）
+//   - userTextFromOsc：OSC A..B 捕获的 user 文本（P1e，pi 渲染的真实 user 文本，校准信号）
+//   - role：'assistant'(OSC) | 'mixed'(idle 合录)
+// 用 userTextFromOsc 与 observeInput 的 userText 比对，记校准日志；observeInput 为空时 fallback 录。
+function onReplyFinalize(observer, payload, reason) {
+  const { assistantText, userTextFromOsc, role } = payload || {};
+  if (assistantText) {
+    writeLog('agent_reply', { type: 'agent_reply', sessionId: observer.sessionId, text: assistantText, bytes: Buffer.byteLength(assistantText, 'utf-8'), reason, role });
+  } else {
+    writeLog('agent_reply_empty', { sessionId: observer.sessionId, reason, role });
   }
-  const text = normalizeVisibleText(observer.replyBuffer);
-  observer.replyBuffer = '';
-  if (!text) return;
-
-  writeLog('agent_reply', { type: 'agent_reply', sessionId: observer.sessionId, text, bytes: Buffer.byteLength(text, 'utf-8') });
-
-  // 关闭当前 record
-  finalizeRecord(observer, 'idle', null);
+  // P1e：user 文本双源校准。observeInput 按键直捕 vs OSC A..B 渲染文本。
+  // 不改 record 结构（userText 已在 beginTurn 录），仅记校准日志供 P1f 决定是否切主源。
+  if (userTextFromOsc) {
+    writeLog('user_text_osc', { sessionId: observer.sessionId, text: userTextFromOsc, bytes: Buffer.byteLength(userTextFromOsc, 'utf-8'), role });
+  }
+  const endState = (reason === 'pty_exit' || reason === 'ws_closed') ? 'session_exit' : 'idle';
+  finalizeRecord(observer, endState, null);
   observer.hasUserMessage = false;
+  observer.terminal?.setHasUserTurn(false);
 }
 
 app.prepare().then(() => {
@@ -520,8 +516,11 @@ function bindPtyWebSocket(ws, sessionId) {
       return;
     }
     if (event.type === 'exit') {
-      flushAgentReply(observer);
+      // P1b：兜底密封 = Warp TerminalModel::exit。先 flushNow 抓取未 finalize 的回复
+      // （OSC 去抖可能还 pending），再 finishTurn，再释放 grid。
+      observer.terminal?.flushNow('pty_exit');
       finalizeRecord(observer, 'session_exit', 'pty_exit');
+      observer.terminal.dispose();   // 释放 headless grid
       writeLog('session_exit', { sessionId, exitCode: event.exitCode, signal: event.signal });
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(`\r\n\x1b[90m[session exited (code ${event.exitCode})]\x1b[0m\r\n`);
@@ -551,8 +550,9 @@ function bindPtyWebSocket(ws, sessionId) {
   });
 
   ws.on('close', () => {
-    flushAgentReply(observer);
+    observer.terminal?.flushNow('ws_closed');
     finalizeRecord(observer, 'session_exit', 'ws_closed');
+    observer.terminal.dispose();   // 释放 headless grid
     writeLog('ws_closed', { sessionId });
     removeSessionListener(sessionId, ptyListener);
     sessionObservers.delete(sessionId);
@@ -581,6 +581,11 @@ function maybeHandleControlMessage(ws, sessionId, text) {
   if (!ctrl || typeof ctrl !== 'object') return false;
   if (ctrl.type === 'resize') {
     const ok = resize(sessionId, ctrl.cols, ctrl.rows);
+    // P1a：同步 headless grid 尺寸，否则 pi 按真实宽度算的 cursor-up 行数与 grid 错位 → snapshot 乱行。
+    if (ok) {
+      try { sessionObservers.get(sessionId)?.terminal?.resize(ctrl.cols, ctrl.rows); }
+      catch (err) { writeLog('grid_resize_failed', { sessionId, cols: ctrl.cols, rows: ctrl.rows, message: err instanceof Error ? err.message : String(err) }); }
+    }
     verboseLog('resize', { sessionId, cols: ctrl.cols, rows: ctrl.rows, ok });
     if (!ok) writeLog('resize_failed', { sessionId, cols: ctrl.cols, rows: ctrl.rows });
     return true;
