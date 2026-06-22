@@ -9,6 +9,8 @@ import type {
   ConversationSource,
   CompletionQueryResponse,
   Workspace,
+  ConversationRecord,
+  ConversationSearchItem,
 } from './types';
 
 export class ApiError extends Error {
@@ -72,6 +74,31 @@ export async function postJson<T>(path: string, body: unknown, options: { signal
   return parsed.data as T;
 }
 
+async function getJson<T>(path: string, options: { signal?: AbortSignal } = {}): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(path, { method: 'GET', signal: options.signal });
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') throw err;
+    throw new ApiError(err instanceof Error ? err.message : '网络错误', 'network_error', 0);
+  }
+
+  let parsed: { ok?: boolean; data?: T; error?: { code: string; message: string } };
+  try {
+    parsed = await res.json();
+  } catch {
+    throw new ApiError(`响应不是合法 JSON (status ${res.status})`, 'invalid_response', res.status);
+  }
+  if (!parsed.ok) {
+    throw new ApiError(
+      parsed.error?.message || `请求失败 (status ${res.status})`,
+      parsed.error?.code || 'unknown_error',
+      res.status,
+    );
+  }
+  return parsed.data as T;
+}
+
 // createSession 响应壳（C-005）：{ session, activeSessions }，不再直接是 SessionInfo
 export interface CreateSessionResponse {
   session: SessionInfo;
@@ -111,7 +138,8 @@ export function addConversationSource(body: { path: string; agentType: string; l
 }
 
 export function listConversationSources(options?: { signal?: AbortSignal }): Promise<{ items: ConversationSource[] }> {
-  return postJson<{ items: ConversationSource[] }>('/api/conversation-sources', {}, options);
+  // POST 表示新增来源；列表必须使用 GET，避免空 body 被当作新增请求。
+  return getJson<{ items: ConversationSource[] }>('/api/conversation-sources', options);
 }
 
 // 统一封装走 fetch + 响应壳校验，AbortError 透传与其他方法一致
@@ -169,12 +197,12 @@ export function killSession(id: string, options?: { signal?: AbortSignal }): Pro
   return postJson<{ killed: boolean }>(`/api/session/${encodeURIComponent(id)}/kill`, {}, options);
 }
 
-export function searchRecords(body: { query: string; limit?: number; scope?: string }, options?: { signal?: AbortSignal }): Promise<{ items: unknown[] }> {
-  return postJson<{ items: unknown[] }>('/api/records/search', body, options);
+export function searchRecords(body: { query: string; limit?: number; scope?: string }, options?: { signal?: AbortSignal }): Promise<{ items: ConversationSearchItem[] }> {
+  return postJson<{ items: ConversationSearchItem[] }>('/api/records/search', body, options);
 }
 
-export function getRecordDetail(body: { recordId: string }, options?: { signal?: AbortSignal }): Promise<{ record: unknown }> {
-  return postJson<{ record: unknown }>('/api/records/detail', body, options);
+export function getRecordDetail(body: { recordId: string }, options?: { signal?: AbortSignal }): Promise<{ record: ConversationRecord }> {
+  return postJson<{ record: ConversationRecord }>('/api/records/detail', body, options);
 }
 
 export function deleteRecord(body: { recordId: string }, options?: { signal?: AbortSignal }): Promise<{ ok: true; deleted: boolean }> {

@@ -12,9 +12,10 @@
  *   - 下次同步时只读取新增行
  */
 
-import { readFileSync, statSync, watch } from 'node:fs';
-import { resolve, dirname, basename } from 'node:path';
-import Database from 'better-sqlite3';
+import { readFileSync, readdirSync, statSync, watch } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { dirname } from 'node:path';
+import { Database } from '@tursodatabase/database/compat';
 import {
   listConversationSources,
   insertConversationsBatch,
@@ -30,7 +31,7 @@ import {
 /**
  * 创建导入引擎实例。
  * @param {object} options - 引擎配置
- * @param {import('better-sqlite3').Database} options.db - 数据库实例
+ * @param {Database} options.db - 数据库实例
  * @returns {object} 引擎实例
  */
 export function createImportEngine(options) {
@@ -44,6 +45,29 @@ export function createImportEngine(options) {
   let schedulerTimer = null;
   let watcher = null;
   let isRunning = false;
+
+  /** 根据来源、文件和消息位置生成稳定 ID，确保重复扫描不会重复写入。 */
+  function createRecordId(sourceId, filePath, index, message) {
+    return createHash('sha256')
+      .update(`${sourceId}\0${filePath}\0${index}\0${message.role}\0${message.content || ''}`)
+      .digest('hex');
+  }
+
+  /** 递归收集目录中的 JSONL 会话文件。 */
+  function listJsonlFiles(root) {
+    const files = [];
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      const path = `${root}${root.endsWith('/') || root.endsWith('\\') ? '' : '/'}${entry.name}`;
+      if (entry.isDirectory()) files.push(...listJsonlFiles(path));
+      else if (entry.isFile() && entry.name.endsWith('.jsonl')) files.push(path);
+    }
+    return files;
+  }
+
+  /** 返回来源当前实际记录数，避免把本轮新增数误写成累计数。 */
+  function countSourceRecords(sourceId) {
+    return db.prepare('SELECT COUNT(*) AS total FROM conversations WHERE source_id = ?').get(sourceId)?.total || 0;
+  }
 
   // ===================== 增量元数据 =====================
 
@@ -115,18 +139,6 @@ export function createImportEngine(options) {
     }
   }
 
-  /**
-   * 读取文件中的新增行（基于上次行数）。
-   * @param {string} filePath - 文件路径
-   * @param {number} lastLineCount - 上次行数
-   * @returns {string[]} 新增行数组
-   */
-  function readNewLines(filePath, lastLineCount) {
-    const content = readFileSync(filePath, 'utf-8');
-    const allLines = content.split('\n').filter((_, idx) => idx >= lastLineCount);
-    return allLines;
-  }
-
   // ===================== 核心同步逻辑 =====================
 
   /**
@@ -145,24 +157,30 @@ export function createImportEngine(options) {
   async function syncSource(sourceId) {
     const importedCount = 0;
     const skippedCount = 0;
-    const failedCount = 0;
 
     // 查询源记录
     const stmt = db.prepare(`
       SELECT id, path, agent_type, metadata, status FROM conversation_sources WHERE id = ?
     `);
-    const source = stmt.get(sourceId);
+    const row = stmt.get(sourceId);
 
-    if (!source) {
+    if (!row) {
       return { importedCount, skippedCount, failedCount: 1 };
     }
+
+    // SQL 使用蛇形字段名，显式映射可避免 agentType 变成 undefined 后误走错误解析分支。
+    const source = {
+      ...row,
+      agentType: row.agent_type,
+    };
 
     const filePath = source.path;
     const agentType = source.agentType;
 
     // 检查文件是否存在
+    let sourceStat;
     try {
-      statSync(filePath);
+      sourceStat = statSync(filePath);
     } catch {
       // 文件不存在，标记错误
       updateConversationSourceStatus(sourceId, {
@@ -171,6 +189,43 @@ export function createImportEngine(options) {
         status: 'error',
       });
       return { importedCount, skippedCount: 0, failedCount: 1 };
+    }
+
+    if (sourceStat.isDirectory()) {
+      try {
+        const files = listJsonlFiles(filePath);
+        const records = [];
+        for (const sourceFile of files) {
+          const messages = parseConversationFile(sourceFile, agentType);
+          messages.forEach((msg, idx) => records.push({
+            id: createRecordId(sourceId, sourceFile, idx, msg),
+            sourceId,
+            sessionId: null,
+            role: msg.role,
+            content: msg.content,
+            toolCalls: msg.toolCalls || null,
+            toolCallId: msg.toolCallId || null,
+            metadata: msg.timestamp ? JSON.stringify({ timestamp: msg.timestamp }) : null,
+            endedAt: msg.timestamp || null,
+          }));
+          // 大目录扫描时主动让出事件循环，保证 HTTP/PTY 不被同步解析长期阻塞。
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+        const inserted = insertConversationsBatch(records);
+        updateConversationSourceStatus(sourceId, {
+          lastSyncedAt: new Date().toISOString(),
+          recordCount: countSourceRecords(sourceId),
+          status: 'active',
+        });
+        return { importedCount: inserted, skippedCount: files.length === 0 ? 1 : 0, failedCount: 0 };
+      } catch {
+        updateConversationSourceStatus(sourceId, {
+          lastSyncedAt: new Date().toISOString(),
+          recordCount: countSourceRecords(sourceId),
+          status: 'error',
+        });
+        return { importedCount: 0, skippedCount: 0, failedCount: 1 };
+      }
     }
 
     // opencode 走 SQLite 增量路径
@@ -200,7 +255,7 @@ export function createImportEngine(options) {
 
       // 转换为数据库记录格式
       const records = messages.map((msg, idx) => ({
-        id: `${sourceId}-${idx}-${Date.now()}`,
+        id: createRecordId(sourceId, filePath, idx, msg),
         sourceId: sourceId,
         sessionId: null,
         role: msg.role,
@@ -217,7 +272,7 @@ export function createImportEngine(options) {
       // 更新源状态
       updateConversationSourceStatus(sourceId, {
         lastSyncedAt: new Date().toISOString(),
-        recordCount: inserted,
+        recordCount: countSourceRecords(sourceId),
         status: 'active',
       });
 
@@ -229,7 +284,7 @@ export function createImportEngine(options) {
         skippedCount: 0,
         failedCount: 0,
       };
-    } catch (err) {
+    } catch {
       // 解析失败，标记错误
       updateConversationSourceStatus(sourceId, {
         lastSyncedAt: new Date().toISOString(),
@@ -249,7 +304,7 @@ export function createImportEngine(options) {
     const lastMessageTime = incremental.lastMessageTime || 0;
 
     try {
-      const odb = new Database(filePath, { readonly: true, fileMustExist: true });
+      const odb = new Database(filePath, { readonly: true });
 
       // 获取最新的 time_created 作为增量基准
       const maxTimeRow = odb.prepare('SELECT MAX(time_created) as maxTime FROM message').get();
@@ -267,15 +322,15 @@ export function createImportEngine(options) {
 
       // 转换为数据库记录格式
       const records = messages.map((msg, idx) => ({
-        id: `${sourceId}-${idx}-${Date.now()}`,
+        id: createRecordId(sourceId, filePath, idx, msg),
         sourceId: sourceId,
         sessionId: null,
         role: msg.role,
         content: msg.content,
         toolCalls: msg.toolCalls || null,
         toolCallId: msg.toolCallId || null,
-        metadata: msg.metadata || null,
-        endedAt: msg.endedAt || null,
+        metadata: msg.timestamp ? JSON.stringify({ timestamp: msg.timestamp }) : null,
+        endedAt: msg.timestamp || null,
       }));
 
       // 批量插入
@@ -284,7 +339,7 @@ export function createImportEngine(options) {
       // 更新源状态
       updateConversationSourceStatus(sourceId, {
         lastSyncedAt: new Date().toISOString(),
-        recordCount: inserted,
+        recordCount: countSourceRecords(sourceId),
         status: 'active',
       });
 
@@ -296,75 +351,13 @@ export function createImportEngine(options) {
         skippedCount: 0,
         failedCount: 0,
       };
-    } catch (err) {
+    } catch {
       updateConversationSourceStatus(sourceId, {
         lastSyncedAt: new Date().toISOString(),
         recordCount: 0,
         status: 'error',
       });
       return { importedCount: 0, skippedCount: 0, failedCount: 1 };
-    }
-  }
-
-    // 获取当前文件元数据
-    const { size, lineCount } = getFileMeta(filePath);
-    const incremental = getIncrementalMeta(source);
-
-    // 判断是否有增量
-    if (size === incremental.lastFileSize && lineCount === incremental.lastLineCount) {
-      // 无变化，跳过
-      return { importedCount, skippedCount: 1, failedCount: 0 };
-    }
-
-    try {
-      // 检测格式（使用 agent_type 作为提示，但实际检测文件内容）
-      const format = detectFormat(filePath);
-      if (!format) {
-        throw new Error(`无法识别文件格式: ${filePath}`);
-      }
-
-      // 解析对话
-      const messages = parseConversationFile(filePath, format);
-
-      // 转换为数据库记录格式
-      const records = messages.map((msg, idx) => ({
-        id: `${sourceId}-${idx}-${Date.now()}`,
-        sourceId: sourceId,
-        sessionId: null,
-        role: msg.role,
-        content: msg.content,
-        toolCalls: msg.toolCalls || null,
-        toolCallId: msg.toolCallId || null,
-        metadata: msg.timestamp ? JSON.stringify({ timestamp: msg.timestamp }) : null,
-        endedAt: msg.timestamp,
-      }));
-
-      // 批量插入
-      const inserted = insertConversationsBatch(records);
-
-      // 更新源状态
-      updateConversationSourceStatus(sourceId, {
-        lastSyncedAt: new Date().toISOString(),
-        recordCount: inserted,
-        status: 'active',
-      });
-
-      // 保存增量元数据
-      saveIncrementalMeta(sourceId, size, lineCount);
-
-      return {
-        importedCount: inserted,
-        skippedCount: 0,
-        failedCount: 0,
-      };
-    } catch (err) {
-      // 解析失败，标记错误
-      updateConversationSourceStatus(sourceId, {
-        lastSyncedAt: new Date().toISOString(),
-        recordCount: 0,
-        status: 'error',
-      });
-      return { importedCount, skippedCount: 0, failedCount: 1 };
     }
   }
 

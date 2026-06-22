@@ -1,80 +1,80 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
-import { useRouter } from 'next/navigation';
+import Link from 'next/link';
+import { useCallback, useEffect, useState } from 'react';
 import { searchRecords } from '../lib/api';
+import type { ConversationSearchItem } from '../lib/types';
 
-const SEARCH_DEBOUNCE_MS = 200;
-
-// FTS5 snippet 返回的 row 结构（与 server.mjs handleRecordsSearch / database.mjs searchConversations 对齐）
-interface SearchHit {
-  conversation: {
-    id: string;
-    source_id: string;
-    session_id: string | null;
-    role: 'user' | 'assistant' | 'system' | 'tool';
-    content: string | null;
-    tool_calls: string | null;
-    tool_call_id: string | null;
-    metadata: string | null;
-    user_text: string | null;
-    ended_at: string | null;
-    created_at: string;
-  };
-  snippet: string | null;
-  rank: number;
+function formatTime(value: string | null): string {
+  if (!value) return '时间未知';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
-// 把 FTS5 snippet 里的 <mark>...</mark> 转成 JSX 高亮片段
-function renderHighlight(snippet: string | null, fallback: string): React.ReactNode {
-  if (!snippet) return fallback;
-  const parts: React.ReactNode[] = [];
-  const re = /<mark>([\s\S]*?)<\/mark>/g;
-  let last = 0;
-  let m: RegExpExecArray | null;
-  let key = 0;
-  while ((m = re.exec(snippet)) !== null) {
-    if (m.index > last) parts.push(snippet.slice(last, m.index));
-    parts.push(
-      <mark key={`hl-${key++}`} className="bg-[rgba(165,213,254,0.25)] text-[color:var(--color-fg-primary)] rounded px-0.5">
-        {m[1]}
-      </mark>,
-    );
-    last = re.lastIndex;
-  }
-  if (last < snippet.length) parts.push(snippet.slice(last));
-  return parts;
-}
+export default function HistoryPage() {
+  const [items, setItems] = useState<ConversationSearchItem[]>([]);
+  const [query, setQuery] = useState('');
+  const [error, setError] = useState<string | null>(null);
 
-function relativeTime(iso: string): string {
-  const t = new Date(iso).getTime();
-  if (Number.isNaN(t)) return '';
-  const diff = Date.now() - t;
-  const m = Math.floor(diff / 60_000);
-  if (m < 1) return '刚刚';
-  if (m < 60) return `${m} 分钟前`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h} 小时前`;
-  const d = Math.floor(h / 24);
-  if (d < 30) return `${d} 天前`;
-  return new Date(iso).toLocaleDateString();
-}
+  const load = useCallback((value: string) => {
+    setError(null);
+    searchRecords({ query: value.trim() || '*', limit: 50 })
+      .then((result) => setItems(result.items))
+      .catch((err) => setError(err instanceof Error ? err.message : '加载历史失败'));
+  }, []);
 
-function Logo() {
+  useEffect(() => {
+    // 初次加载放在异步回调中，避免 effect 内同步级联更新。
+    searchRecords({ query: '*', limit: 50 })
+      .then((result) => setItems(result.items))
+      .catch((err) => setError(err instanceof Error ? err.message : '加载历史失败'));
+  }, []);
+
   return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <rect x="2" y="3" width="20" height="14" rx="2.5" stroke="var(--color-accent)" strokeWidth="1.5" />
-      <path d="M6 9 L9.5 12 L6 15" stroke="var(--color-accent-2)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" fill="none" />
-      <line x1="11" y1="15" x2="15" y2="15" stroke="var(--color-accent-warn)" strokeWidth="1.6" strokeLinecap="round" />
-    </svg>
-  );
-}
+    <main className="min-h-screen bg-[color:var(--color-bg-primary)] text-[color:var(--color-fg-primary)]">
+      <header className="h-12 border-b border-[color:var(--color-border-subtle)] px-5 flex items-center gap-4">
+        <Link href="/" className="text-sm hover:text-[color:var(--color-accent)]">nterminal</Link>
+        <span className="text-sm text-[color:var(--color-fg-secondary)]">对话历史</span>
+      </header>
 
-function SearchIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true" className="text-[color:var(--color-accent)] shrink-0">
-      <circle cx="11" cy="11" r="6" stroke="currentColor" strokeWidth="1.6" />
-      <line x1="16" y1="16" x2="20" y2="20" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-    </svg>
+      <div className="max-w-4xl mx-auto p-5">
+        <form
+          className="flex gap-2 mb-5"
+          onSubmit={(event) => { event.preventDefault(); load(query); }}
+        >
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="搜索对话内容"
+            className="flex-1 rounded border border-[color:var(--color-border-strong)] bg-transparent px-3 py-2 text-sm outline-none"
+          />
+          <button type="submit" className="rounded bg-[color:var(--color-accent-primary)] px-4 py-2 text-sm text-white">
+            搜索
+          </button>
+        </form>
+
+        {error && <p className="mb-4 text-sm text-[color:var(--color-accent-danger)]">{error}</p>}
+        <div className="space-y-2">
+          {items.map(({ conversation, snippet }) => (
+            <Link
+              key={conversation.id}
+              href={`/history/detail?recordId=${encodeURIComponent(conversation.id)}`}
+              className="block rounded border border-[color:var(--color-border-subtle)] p-3 hover:border-[color:var(--color-border-strong)]"
+            >
+              <div className="mb-1 flex items-center justify-between gap-3 text-xs text-[color:var(--color-fg-tertiary)]">
+                <span>{conversation.role}</span>
+                <span>{formatTime(conversation.endedAt || conversation.createdAt)}</span>
+              </div>
+              <p className="line-clamp-3 whitespace-pre-wrap text-sm">
+                {snippet || conversation.content || '（空内容）'}
+              </p>
+            </Link>
+          ))}
+          {!error && items.length === 0 && (
+            <p className="py-12 text-center text-sm text-[color:var(--color-fg-quaternary)]">暂无对话记录</p>
+          )}
+        </div>
+      </div>
+    </main>
   );
 }

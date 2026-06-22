@@ -9,15 +9,15 @@
  */
 
 import { mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import Database from 'better-sqlite3';
+import { dirname } from 'node:path';
+import { Database } from '@tursodatabase/database/compat';
 
-/** @type {Database.Database | null} */
+/** @type {Database | null} */
 let db = null;
 
 /**
  * 升级 conversation_sources 表的 agent_type CHECK 约束，添加 opencode。
- * @param {Database.Database} database
+ * @param {Database} database
  */
 function upgradeAgentTypeCheck(database) {
   // 检查当前 conversation_sources 表的 CREATE 语句是否包含 opencode
@@ -54,7 +54,7 @@ function upgradeAgentTypeCheck(database) {
 
 /**
  * 添加 conversations.cwd 列（如果缺失）。
- * @param {Database.Database} database
+ * @param {Database} database
  */
 function addCwdColumnIfMissing(database) {
   const columns = database.prepare("PRAGMA table_info(conversations)").all();
@@ -64,9 +64,65 @@ function addCwdColumnIfMissing(database) {
 }
 
 /**
+ * 把旧版生成列迁移为普通列。Turso 默认不启用生成列，显式存储还能兼容纯文本 content。
+ * @param {Database} database
+ */
+function upgradeConversationSchema(database) {
+  const row = database.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='conversations'"
+  ).get();
+  if (!row?.sql) return;
+  const hasGeneratedUserText = /user_text\s+TEXT\s+GENERATED/i.test(row.sql);
+  const hasRequiredSource = /source_id\s+TEXT\s+NOT\s+NULL/i.test(row.sql);
+  if (!hasGeneratedUserText && !hasRequiredSource) return;
+  const userTextExpression = hasGeneratedUserText
+    ? "CASE WHEN role = 'user' THEN content ELSE NULL END"
+    : 'user_text';
+
+  // 重建期间关闭外键，避免重命名旧表时改写引用关系。
+  database.pragma('foreign_keys = OFF');
+  try {
+    database.exec(`
+      DROP TRIGGER IF EXISTS conversations_ai;
+      DROP TRIGGER IF EXISTS conversations_ad;
+      DROP TRIGGER IF EXISTS conversations_au;
+      DROP TABLE IF EXISTS conversations_fts;
+      ALTER TABLE conversations RENAME TO conversations_legacy;
+      CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        source_id TEXT,
+        session_id TEXT,
+        role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system', 'tool')),
+        content TEXT,
+        tool_calls TEXT,
+        tool_call_id TEXT,
+        metadata TEXT,
+        user_text TEXT,
+        ended_at TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        cwd TEXT,
+        FOREIGN KEY(source_id) REFERENCES conversation_sources(id) ON DELETE SET NULL
+      );
+      INSERT INTO conversations (
+        id, source_id, session_id, role, content, tool_calls, tool_call_id,
+        metadata, user_text, ended_at, created_at, cwd
+      )
+      SELECT
+        id, source_id, session_id, role, content, tool_calls, tool_call_id,
+        metadata, ${userTextExpression},
+        ended_at, created_at, cwd
+      FROM conversations_legacy;
+      DROP TABLE conversations_legacy;
+    `);
+  } finally {
+    database.pragma('foreign_keys = ON');
+  }
+}
+
+/**
  * 初始化 SQLite 数据库，创建表和索引。
  * @param {string} dbPath - 数据库文件路径
- * @returns {Database.Database} 数据库实例
+ * @returns {Database} 数据库实例
  */
 export function initializeDatabase(dbPath) {
   // 确保数据目录存在
@@ -93,7 +149,7 @@ export function initializeDatabase(dbPath) {
     CREATE TABLE IF NOT EXISTS conversation_sources (
       id TEXT PRIMARY KEY,
       path TEXT NOT NULL,
-      agent_type TEXT NOT NULL CHECK(agent_type IN ('claude', 'pi', 'codex')),
+      agent_type TEXT NOT NULL CHECK(agent_type IN ('claude', 'pi', 'codex', 'opencode')),
       label TEXT,
       metadata TEXT,
       last_synced_at TEXT,
@@ -107,52 +163,29 @@ export function initializeDatabase(dbPath) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY,
-      source_id TEXT NOT NULL,
+      source_id TEXT,
       session_id TEXT,
       role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system', 'tool')),
       content TEXT,
       tool_calls TEXT,
       tool_call_id TEXT,
       metadata TEXT,
-      user_text TEXT GENERATED ALWAYS AS (json_extract(content, '$.text')) STORED,
+      user_text TEXT,
       ended_at TEXT,
       created_at TEXT DEFAULT (datetime('now')),
-      FOREIGN KEY(source_id) REFERENCES conversation_sources(id)
+      FOREIGN KEY(source_id) REFERENCES conversation_sources(id) ON DELETE SET NULL
     );
   `);
 
-  // 创建 FTS5 全文索引虚拟表
-  db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(
-      user_text,
-      content,
-      content='conversations',
-      content_rowid='rowid'
-    );
-  `);
+  // 旧版生成列无法被 Turso 默认配置解析，启动时迁移为普通列。
+  upgradeConversationSchema(db);
 
-  // 创建触发器：插入对话时同步更新 FTS 索引
+  // Turso 当前构建不包含 FTS5；清理旧索引，搜索统一使用参数化 LIKE。
   db.exec(`
-    CREATE TRIGGER IF NOT EXISTS conversations_ai AFTER INSERT ON conversations BEGIN
-      INSERT INTO conversations_fts(rowid, user_text, content)
-      VALUES (new.rowid, new.user_text, COALESCE(new.content, ''));
-    END;
-  `);
-
-  // 创建触发器：删除对话时同步更新 FTS 索引
-  db.exec(`
-    CREATE TRIGGER IF NOT EXISTS conversations_ad AFTER DELETE ON conversations BEGIN
-      DELETE FROM conversations_fts WHERE rowid = old.rowid;
-    END;
-  `);
-
-  // 创建触发器：更新对话时同步更新 FTS 索引
-  db.exec(`
-    CREATE TRIGGER IF NOT EXISTS conversations_au AFTER UPDATE ON conversations BEGIN
-      DELETE FROM conversations_fts WHERE rowid = old.rowid;
-      INSERT INTO conversations_fts(rowid, user_text, content)
-      VALUES (new.rowid, new.user_text, COALESCE(new.content, ''));
-    END;
+    DROP TRIGGER IF EXISTS conversations_ai;
+    DROP TRIGGER IF EXISTS conversations_ad;
+    DROP TRIGGER IF EXISTS conversations_au;
+    DROP TABLE IF EXISTS conversations_fts;
   `);
 
   // 创建索引
@@ -336,10 +369,12 @@ export function insertConversation({
 }) {
   const database = getDb();
   const stmt = database.prepare(`
-    INSERT OR IGNORE INTO conversations (id, source_id, session_id, role, content, tool_calls, tool_call_id, metadata, ended_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT OR IGNORE INTO conversations (id, source_id, session_id, role, content, tool_calls, tool_call_id, metadata, user_text, ended_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  const result = stmt.run(id, sourceId, sessionId, role, content, toolCalls, toolCallId, metadata, endedAt);
+  // 只有用户输入参与补全，避免助手输出污染候选词。
+  const userText = role === 'user' ? content : null;
+  const result = stmt.run(id, sourceId, sessionId, role, content, toolCalls, toolCallId, metadata, userText, endedAt);
   return result.changes > 0;
 }
 
@@ -351,8 +386,8 @@ export function insertConversation({
 export function insertConversationsBatch(records) {
   const database = getDb();
   const insert = database.prepare(`
-    INSERT OR IGNORE INTO conversations (id, source_id, session_id, role, content, tool_calls, tool_call_id, metadata, ended_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT OR IGNORE INTO conversations (id, source_id, session_id, role, content, tool_calls, tool_call_id, metadata, user_text, ended_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const transaction = database.transaction(() => {
@@ -367,6 +402,7 @@ export function insertConversationsBatch(records) {
         record.toolCalls || null,
         record.toolCallId || null,
         record.metadata || null,
+        record.role === 'user' ? record.content || null : null,
         record.endedAt || null,
       );
       count += result.changes;
@@ -401,7 +437,7 @@ export function queryCompletion(prefix, limit = 8) {
 // ===================== 全文检索 =====================
 
 /**
- * FTS5 全文检索。
+ * 对话文本检索。
  * @param {string} query - 搜索关键词
  * @param {'all' | 'user'} scope - 搜索范围
  * @param {number} limit - 返回条数
@@ -410,37 +446,24 @@ export function queryCompletion(prefix, limit = 8) {
 export function searchConversations(query, scope = 'all', limit = 20) {
   const database = getDb();
 
-  if (scope === 'user') {
-    // 仅搜索 user_text
-    const stmt = database.prepare(`
-      SELECT c.*, NULL AS snippet, 0 AS rank
-      FROM conversations c
-      WHERE c.user_text LIKE ?
-      ORDER BY c.ended_at DESC
-      LIMIT ?
-    `);
-    return stmt.all(`%${query}%`, limit).map((row) => ({
-      conversation: row,
-      snippet: null,
-      rank: 0,
-    }));
-  }
-
-  // 全文搜索（FTS5）
+  // “*” 用于首页统计预览；普通查询转义 LIKE 通配符，避免输入改变匹配语义。
+  const escaped = query === '*' ? '' : query.replace(/[\\%_]/g, '\\$&');
+  const pattern = `%${escaped}%`;
+  const condition = scope === 'user'
+    ? "c.user_text LIKE ? ESCAPE '\\'"
+    : "(c.user_text LIKE ? ESCAPE '\\' OR c.content LIKE ? ESCAPE '\\')";
   const stmt = database.prepare(`
-    SELECT c.*,
-           snippet(conversations_fts, 0, '<mark>', '</mark>', '...', 32) AS snippet,
-           rank
-    FROM conversations_fts
-    JOIN conversations c ON conversations_fts.rowid = c.rowid
-    WHERE conversations_fts MATCH ?
-    ORDER BY rank
+    SELECT c.*
+    FROM conversations c
+    WHERE ${condition}
+    ORDER BY c.ended_at DESC, c.rowid DESC
     LIMIT ?
   `);
-  return stmt.all(query, limit).map((row) => ({
+  const params = scope === 'user' ? [pattern, limit] : [pattern, pattern, limit];
+  return stmt.all(...params).map((row) => ({
     conversation: row,
-    snippet: row.snippet,
-    rank: row.rank,
+    snippet: row.content,
+    rank: 0,
   }));
 }
 
@@ -522,6 +545,16 @@ export function listConversations(cursor = null, limit = 50, agentType = null) {
     nextCursor,
     total: totalRow?.total || 0,
   };
+}
+
+/** 按 ID 查询单条对话。 */
+export function getConversationById(id) {
+  return getDb().prepare('SELECT * FROM conversations WHERE id = ?').get(id) || null;
+}
+
+/** 删除单条对话并返回是否命中。 */
+export function deleteConversation(id) {
+  return getDb().prepare('DELETE FROM conversations WHERE id = ?').run(id).changes > 0;
 }
 
 /**

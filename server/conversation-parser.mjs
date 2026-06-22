@@ -9,7 +9,7 @@
  * 格式检测策略：读取首行 JSON，根据特征字段判断 agent 类型。
  */
 
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { parseSessionFile as parseClaudeSession } from './parsers/claude-parser.mjs';
 import { parseSessionFile as parsePiSession } from './parsers/pi-parser.mjs';
 import { parseSessionFile as parseCodexSession } from './parsers/codex-parser.mjs';
@@ -35,7 +35,6 @@ parserRegistry.set('opencode', { parseSessionFile: parseOpencodeSession });
  */
 function isSqliteFile(filePath) {
   try {
-    const buffer = Buffer.alloc(16);
     const fd = readFileSync(filePath, { length: 16, encoding: null });
     // 检查前 16 字节是否以 "SQLite format 3\0" 开头
     return fd.subarray(0, 16).toString('ascii', 0, 15) === 'SQLite format 3';

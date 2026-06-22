@@ -6,7 +6,6 @@ import type { CompletionItem } from '../lib/types';
 interface CompletionPanelProps {
   items: CompletionItem[];
   onSelect: (text: string) => void;
-  onCancel: () => void;
   onHover?: (index: number) => void;
   highlightedIndex: number;
 }
@@ -18,7 +17,6 @@ interface CompletionPanelProps {
 export default function CompletionPanel({
   items,
   onSelect,
-  onCancel,
   onHover,
   highlightedIndex,
 }: CompletionPanelProps) {

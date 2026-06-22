@@ -2,7 +2,8 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { listWorkspaces, createWorkspace, deleteWorkspace, listConversationSources, searchRecords } from '../lib/api';
+import Link from 'next/link';
+import { listWorkspaces, createWorkspace, deleteWorkspace, listConversationSources, createSession } from '../lib/api';
 import type { Workspace, ConversationSource } from '../lib/types';
 import WorkspaceSidebar from './WorkspaceSidebar';
 
@@ -22,13 +23,7 @@ export default function HomePage() {
       ]);
       setWorkspaces(ws);
       setSources(src.items || []);
-      // 获取对话总数
-      try {
-        const result = await searchRecords({ query: '*', limit: 1 });
-        setTotalConversations(result.items?.length || 0);
-      } catch {
-        setTotalConversations(0);
-      }
+      setTotalConversations((src.items || []).reduce((sum, source) => sum + source.recordCount, 0));
     } catch (err) {
       console.error('Failed to load homepage data:', err);
     } finally {
@@ -36,15 +31,20 @@ export default function HomePage() {
     }
   }, []);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => {
+    // 首屏加载延迟到微任务执行，避免 effect 内同步触发状态更新。
+    queueMicrotask(() => { void loadData(); });
+  }, [loadData]);
 
   const handleCreate = useCallback(async () => {
     if (!newPath.trim()) return;
     try {
-      await createWorkspace({ cwd: newPath.trim() });
+      const cwd = newPath.trim();
+      await createWorkspace({ cwd });
+      const { session } = await createSession({ cwd });
       setNewPath('');
       await loadData();
-      router.push(`/terminal?path=${encodeURIComponent(newPath.trim())}`);
+      router.push(`/terminal?sessionId=${encodeURIComponent(session.id)}`);
     } catch (err) {
       alert(err instanceof Error ? err.message : '创建工作区失败');
     }
@@ -60,8 +60,13 @@ export default function HomePage() {
     }
   }, [loadData]);
 
-  const handleNavigate = useCallback((path: string) => {
-    router.push(`/terminal?path=${encodeURIComponent(path)}`);
+  const handleNavigate = useCallback(async (path: string) => {
+    try {
+      const { session } = await createSession({ cwd: path });
+      router.push(`/terminal?sessionId=${encodeURIComponent(session.id)}`);
+    } catch (err) {
+      alert(err instanceof Error ? err.message : '创建终端失败');
+    }
   }, [router]);
 
   if (loading) {
@@ -87,7 +92,7 @@ export default function HomePage() {
         <div className="h-10 border-b border-[color:var(--color-border-subtle)] flex items-center px-4 text-[11px] text-[color:var(--color-fg-tertiary)] gap-4">
           <span>已发现 {sources.length} 个对话源</span>
           <span>已导入 {totalConversations} 条对话</span>
-          <a href="/settings" className="ml-auto hover:text-[color:var(--color-fg-primary)]">管理 →</a>
+          <Link href="/settings" className="ml-auto hover:text-[color:var(--color-fg-primary)]">管理 →</Link>
         </div>
         {/* 主区域：空状态 */}
         <div className="flex-1 flex items-center justify-center text-[color:var(--color-fg-quaternary)] text-sm">

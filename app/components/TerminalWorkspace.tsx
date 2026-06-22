@@ -9,14 +9,14 @@ import {
   useState,
 } from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { Terminal, type TerminalHandle } from '@wterm/react';
 import type { WTerm } from '@wterm/dom';
 import { searchRecords, queryCompletion, createSession, killSession, listSessions } from '../lib/api';
-import type { RecordSearchItem, CompletionItem, TabInfo, Workspace, SessionInfo } from '../lib/types';
+import type { ConversationSearchItem, CompletionItem, TabInfo } from '../lib/types';
 import { MAX_TABS } from '../lib/types';
 import CompletionPanel from './CompletionPanel';
 import TabBar from './TabBar';
-import WorkspaceSidebar from './WorkspaceSidebar';
 
 // 状态机：终端页状态
 type WsStatus = 'connecting' | 'running' | 'exited' | 'error';
@@ -91,7 +91,7 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
   const [wsStatus, setWsStatus] = useState<WsStatus>('connecting');
   const [error, setError] = useState<string | null>(null);
 
-  const [searchResults, setSearchResults] = useState<RecordSearchItem[]>([]);
+  const [searchResults, setSearchResults] = useState<ConversationSearchItem[]>([]);
   const [matchStatus, setMatchStatus] = useState<MatchStatus>('idle');
 
   // ---- 补全状态 ----
@@ -105,7 +105,6 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
   const [tabs, setTabs] = useState<TabInfo[]>(() => {
     if (typeof window === 'undefined') return [];
     try {
-      const stored = sessionStorage.getItem(STORAGE_KEY_ACTIVE_TAB);
       // 新格式只存 activeTabId；tabs 列表从 /api/session/list 重建
       return [];
     } catch {
@@ -122,10 +121,6 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
       return sessionId;
     }
   });
-
-  // ---- 工作区状态（纯内存，与 C-010 一致，不持久化） ----
-  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   // ---- 持久化：仅存 activeTabId ----
   useEffect(() => {
@@ -172,12 +167,14 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
     if (!activeTabId) return;
 
     // 切标签时清理上一个 PTY 的 UI 状态，防止输入/补全/搜索状态泄漏到新 PTY
-    setInputBuffer('');
-    setSearchResults([]);
-    setMatchStatus('idle');
-    setShowCompletion(false);
-    setCompletionItems([]);
-    setCompletionHighlight(-1);
+    queueMicrotask(() => {
+      setInputBuffer('');
+      setSearchResults([]);
+      setMatchStatus('idle');
+      setShowCompletion(false);
+      setCompletionItems([]);
+      setCompletionHighlight(-1);
+    });
     // 取消进行中的搜索/补全 debounce 与 fetch
     if (debounceRef.current) {
       clearTimeout(debounceRef.current);
@@ -205,7 +202,7 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
     wsRef.current = ws;
-    setWsStatus('connecting');
+    queueMicrotask(() => setWsStatus('connecting'));
 
     ws.onopen = () => {
       setWsStatus('running');
@@ -256,12 +253,14 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
     if (abortRef.current) abortRef.current.abort();
 
     if (deferredBuffer.length < 1) {
-      setSearchResults([]);
-      setMatchStatus('idle');
+      queueMicrotask(() => {
+        setSearchResults([]);
+        setMatchStatus('idle');
+      });
       return;
     }
 
-    setMatchStatus('match_pending');
+    queueMicrotask(() => setMatchStatus('match_pending'));
     debounceRef.current = setTimeout(async () => {
       const controller = new AbortController();
       abortRef.current = controller;
@@ -337,8 +336,10 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
     if (completionDebounceRef.current) clearTimeout(completionDebounceRef.current);
 
     if (deferredBuffer.length < 2) {
-      setShowCompletion(false);
-      setCompletionItems([]);
+      queueMicrotask(() => {
+        setShowCompletion(false);
+        setCompletionItems([]);
+      });
       return;
     }
 
@@ -448,10 +449,6 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
       }
       return remaining;
     });
-    // 工作区里同步清掉这个 sessionId
-    setWorkspaces((prev) =>
-      prev.map((ws) => ({ ...ws, sessionIds: ws.sessionIds.filter((sid) => sid !== id) })),
-    );
     // 同步切到下一个活跃（如果有），避免短暂指向已关闭 tab
     if (nextActiveId !== null) {
       setActiveTabId(nextActiveId ?? '');
@@ -482,44 +479,8 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
     }
   }, [tabs.length]);
 
-  // 侧边栏点击会话 = 切换到对应标签
-  const handleSessionSelect = useCallback((id: string) => {
-    setActiveTabId(id);
-  }, []);
-
-  // ---- 工作区管理 ----
-  const handleWorkspaceCreate = useCallback((name: string) => {
-    const ws: Workspace = {
-      id: crypto.randomUUID(),
-      name,
-      sessionIds: [],
-    };
-    setWorkspaces((prev) => [...prev, ws]);
-  }, []);
-
-  const handleWorkspaceRename = useCallback((id: string, name: string) => {
-    setWorkspaces((prev) =>
-      prev.map((ws) => (ws.id === id ? { ...ws, name } : ws)),
-    );
-  }, []);
-
-  const handleWorkspaceDelete = useCallback((id: string) => {
-    if (!confirm('确定删除此工作区？')) return;
-    setWorkspaces((prev) => prev.filter((ws) => ws.id !== id));
-  }, []);
-
-  const handleSessionDrop = useCallback((sessionId: string, workspaceId: string) => {
-    setWorkspaces((prev) =>
-      prev.map((ws) =>
-        ws.id === workspaceId && !ws.sessionIds.includes(sessionId)
-          ? { ...ws, sessionIds: [...ws.sessionIds, sessionId] }
-          : ws,
-      ),
-    );
-  }, []);
-
   // 测量单字符宽度（monospace），用于把 textarea 锚定到光标列。
-  function measureCharWidth(wt: WTerm): number {
+  const measureCharWidth = useCallback((wt: WTerm): number => {
     try {
       const row = document.createElement('div');
       row.className = 'term-row';
@@ -534,10 +495,10 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
       if (w > 0) return w;
     } catch { /* ignore */ }
     return 0;
-  }
+  }, []);
 
   // 每帧把隐藏 textarea 移到当前光标像素位置（仅终端聚焦时）。
-  function repositionImeTextarea(wt: WTerm) {
+  const repositionImeTextarea = useCallback((wt: WTerm) => {
     const ta = wt.element.querySelector('textarea');
     if (!ta) return;
     const bridge = wt.bridge;
@@ -546,7 +507,7 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
     if (!focused) return;
     const cursor = bridge.getCursor();
     const rowH = (wt as unknown as { _rowHeight?: number })._rowHeight || 18;
-    let charW = charWidthRef.current || measureCharWidth(wt);
+    const charW = charWidthRef.current || measureCharWidth(wt);
     if (charW > 0) charWidthRef.current = charW;
     if (!cursor || !cursor.visible || charW <= 0) return;
     const cs = getComputedStyle(wt.element);
@@ -564,7 +525,7 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
     s.top = `${Math.round(top)}px`;
     s.width = `${Math.round(charW)}px`;
     s.height = `${Math.round(rowH)}px`;
-  }
+  }, [measureCharWidth]);
 
   const handleTerminalReady = useCallback((wt: WTerm) => {
     wtRef.current = wt;
@@ -602,7 +563,7 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
         ta.removeEventListener('blur', stop);
       }
     };
-  }, []);
+  }, [measureCharWidth, repositionImeTextarea]);
 
   // 清屏：清 wterm 可视区 + scrollback（不触碰 PTY 状态，prompt 下次输出重绘）
   const handleClearScreen = useCallback(() => {
@@ -640,8 +601,8 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
     }
   }, [matchStatus, searchResults.length]);
 
-  function handleResultClick(item: RecordSearchItem) {
-    router.push(`/history/detail?recordId=${encodeURIComponent(item.recordId)}`);
+  function handleResultClick(item: ConversationSearchItem) {
+    router.push(`/history/detail?recordId=${encodeURIComponent(item.conversation.id)}`);
   }
 
   if (!sessionId) {
@@ -652,24 +613,8 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
     );
   }
 
-  // 把真实 tabs 投影成 sidebar 需要的 {id,label} 形状（按 cwd 派生的可读标签）
-  const sidebarSessions = tabs.map((t) => ({ id: t.id, label: t.label }));
-
   return (
     <div className="flex h-screen overflow-hidden">
-      {/* 左侧工作区侧边栏 —— sessions 用真实 PTY id，tab.id === sessionId */}
-      <WorkspaceSidebar
-        workspaces={workspaces}
-        sessions={sidebarSessions}
-        onWorkspaceCreate={handleWorkspaceCreate}
-        onWorkspaceRename={handleWorkspaceRename}
-        onWorkspaceDelete={handleWorkspaceDelete}
-        onSessionDrop={handleSessionDrop}
-        onSessionSelect={handleSessionSelect}
-        collapsed={sidebarCollapsed}
-        onToggleCollapse={() => setSidebarCollapsed((p) => !p)}
-      />
-
       <div className="flex-1 flex flex-col min-w-0">
         {/* 顶部 chrome —— 深色磨砂 + 状态 pill */}
         <header
@@ -677,21 +622,21 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
           style={{ WebkitBackdropFilter: 'blur(10px)' }}
         >
           <div className="flex items-center gap-3">
-            <a href="/" className="flex items-center gap-2 text-sm hover:opacity-80 transition-opacity" aria-label="返回首页">
+            <Link href="/" className="flex items-center gap-2 text-sm hover:opacity-80 transition-opacity" aria-label="返回首页">
               <TerminalLogo />
               <span className="font-semibold tracking-tight">nterminal</span>
-            </a>
+            </Link>
             <span className="text-[color:var(--color-fg-quaternary)] text-xs">·</span>
             <span className={wsPillClass} data-testid="status">
               <span className="dot" />
               {wsStatusText}
             </span>
-            <a
+            <Link
               href="/settings"
               className="text-[11px] text-[color:var(--color-fg-tertiary)] hover:text-[color:var(--color-fg-primary)] transition-colors"
             >
               设置
-            </a>
+            </Link>
           </div>
 
           <div className="flex items-center gap-3 text-sm">
@@ -768,7 +713,6 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
             <CompletionPanel
               items={completionItems}
               onSelect={handleCompletionSelect}
-              onCancel={handleCompletionCancel}
               onHover={handleCompletionHover}
               highlightedIndex={completionHighlight}
             />
@@ -819,22 +763,22 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
                 <ul className="py-1">
                   {searchResults.map((item) => (
                     <li
-                      key={item.recordId}
+                      key={item.conversation.id}
                       className="group cursor-pointer px-3 py-2 hover:bg-[rgba(165,213,254,0.07)] border-l-2 border-transparent hover:border-[color:var(--color-accent)] transition-colors"
                       onClick={() => handleResultClick(item)}
                       data-testid="search-item"
                     >
                       <div className="flex items-center gap-1.5 text-[10px] text-[color:var(--color-fg-tertiary)] mono mb-0.5">
                         <ChevronIcon />
-                        <span className="truncate" title={item.cwd}>{item.displayName || item.cwd}</span>
+                        <span className="truncate" title={item.conversation.cwd || ''}>{item.conversation.cwd || item.conversation.role}</span>
                       </div>
                       <div className="text-[12.5px] text-[color:var(--color-fg-primary)] truncate">
-                        {item.userTextPreview || <span className="text-[color:var(--color-fg-quaternary)]">(空)</span>}
+                        {item.snippet || item.conversation.content || <span className="text-[color:var(--color-fg-quaternary)]">(空)</span>}
                       </div>
                       <div className="flex items-center gap-2 mt-0.5">
-                        <span className="chip text-[9px] mono">{item.endState}</span>
+                        <span className="chip text-[9px] mono">{item.conversation.role}</span>
                         <span className="text-[10px] text-[color:var(--color-fg-quaternary)]">
-                          {new Date(item.startedAt).toLocaleTimeString()}
+                          {new Date(item.conversation.endedAt || item.conversation.createdAt).toLocaleTimeString()}
                         </span>
                       </div>
                     </li>

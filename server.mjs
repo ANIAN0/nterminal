@@ -40,7 +40,9 @@ import {
   listConversationSources,
   deleteConversationSource as dbDeleteConversationSource,
   queryCompletion as dbQueryCompletion,
-  listConversations,
+  searchConversations,
+  getConversationById,
+  deleteConversation,
 } from './server/database.mjs';
 import { createImportEngine } from './server/conversation-import.mjs';
 import { getActiveSessions } from './server/pty-manager.mjs';
@@ -177,16 +179,6 @@ app.prepare().then(() => {
   // 创建导入引擎：定时同步（1h）+ fs.watch 文件变更触发
   // 设计 C-001/C-013：startup → initializeDatabase → syncAll → startScheduler → startWatcher
   importEngine = createImportEngine({ db: getDb() });
-  importEngine
-    .syncAll()
-    .then((results) => {
-      writeLog('import_sync_initial', {
-        sources: results.length,
-        imported: results.reduce((acc, r) => acc + r.result.importedCount, 0),
-        failed: results.reduce((acc, r) => acc + r.result.failedCount, 0),
-      });
-    })
-    .catch((err) => writeLog('import_sync_initial_failed', { message: err instanceof Error ? err.message : String(err) }));
   importEngine.startScheduler();
   importEngine.startWatcher();
 
@@ -254,6 +246,15 @@ app.prepare().then(() => {
               return;
             case '/api/completion/query':
               await handleCompletionQuery(req, res);
+              return;
+            case '/api/records/search':
+              await handleRecordsSearch(req, res);
+              return;
+            case '/api/records/detail':
+              await handleRecordsDetail(req, res);
+              return;
+            case '/api/records/delete':
+              await handleRecordsDelete(req, res);
               return;
             case '/api/workspaces/list':
               await handleWorkspacesList(req, res);
@@ -323,6 +324,18 @@ app.prepare().then(() => {
   server.listen(port, hostname, () => {
     writeLog('server_listen', { url: `http://${hostname}:${port}` });
     console.log(`> Ready on http://${hostname}:${port}`);
+    // 服务先监听再扫描大型历史目录，避免首次启动长时间无法接受请求。
+    setImmediate(() => {
+      importEngine.syncAll()
+        .then((results) => {
+          writeLog('import_sync_initial', {
+            sources: results.length,
+            imported: results.reduce((acc, r) => acc + r.result.importedCount, 0),
+            failed: results.reduce((acc, r) => acc + r.result.failedCount, 0),
+          });
+        })
+        .catch((err) => writeLog('import_sync_initial_failed', { message: err instanceof Error ? err.message : String(err) }));
+    });
   });
 });
 
@@ -395,8 +408,8 @@ async function handleConversationSources(req, res, parsedUrl) {
       errorResponse(res, 400, 'invalid_path', 'path 必须是非空字符串');
       return;
     }
-    if (!body?.agentType || !['claude', 'pi', 'codex'].includes(body.agentType)) {
-      errorResponse(res, 400, 'invalid_agentType', 'agentType 必须是 claude / pi / codex');
+    if (!body?.agentType || !['claude', 'pi', 'codex', 'opencode'].includes(body.agentType)) {
+      errorResponse(res, 400, 'invalid_agentType', 'agentType 必须是 claude / pi / codex / opencode');
       return;
     }
     if (handleValidationError(res, validatePath(body.path))) return;
@@ -494,6 +507,64 @@ async function handleCompletionQuery(req, res) {
   }
 }
 
+// 数据库使用蛇形字段名，HTTP 契约统一转换为前端使用的驼峰字段。
+function serializeConversation(row) {
+  return {
+    id: row.id,
+    sourceId: row.source_id,
+    sessionId: row.session_id,
+    role: row.role,
+    content: row.content,
+    toolCalls: row.tool_calls,
+    toolCallId: row.tool_call_id,
+    metadata: row.metadata,
+    userText: row.user_text,
+    endedAt: row.ended_at,
+    createdAt: row.created_at,
+    cwd: row.cwd,
+  };
+}
+
+async function handleRecordsSearch(req, res) {
+  const body = await readJsonBody(req);
+  if (handleValidationError(res, validateQuery(body?.query, { required: true }))) return;
+  const limit = Math.min(Math.max(parseInt(body?.limit ?? 20, 10) || 20, 1), 50);
+  const scope = body?.scope === 'user' ? 'user' : 'all';
+  try {
+    const items = searchConversations(body.query, scope, limit).map((item) => ({
+      conversation: serializeConversation(item.conversation),
+      snippet: item.snippet,
+      rank: item.rank,
+    }));
+    sendJson(res, 200, { ok: true, data: { items } });
+  } catch (err) {
+    errorResponse(res, 500, 'search_failed', err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function handleRecordsDetail(req, res) {
+  const body = await readJsonBody(req);
+  if (typeof body?.recordId !== 'string' || !body.recordId) {
+    errorResponse(res, 400, 'invalid_recordId', 'recordId 必须是非空字符串');
+    return;
+  }
+  const record = getConversationById(body.recordId);
+  if (!record) {
+    errorResponse(res, 404, 'record_not_found', `记录 ${body.recordId} 不存在`);
+    return;
+  }
+  sendJson(res, 200, { ok: true, data: { record: serializeConversation(record) } });
+}
+
+async function handleRecordsDelete(req, res) {
+  const body = await readJsonBody(req);
+  if (typeof body?.recordId !== 'string' || !body.recordId) {
+    errorResponse(res, 400, 'invalid_recordId', 'recordId 必须是非空字符串');
+    return;
+  }
+  sendJson(res, 200, { ok: true, data: { deleted: deleteConversation(body.recordId) } });
+}
+
 // ===================== 会话列表 API =====================
 
 async function handleSessionsList(req, res) {
@@ -548,7 +619,7 @@ async function handleWorkspacesList(req, res) {
 
 async function handleWorkspacesCreate(req, res) {
   try {
-    const body = await readBoundedRequestBody(req);
+    const body = await readJsonBody(req);
     const { cwd, displayName } = body;
     if (!cwd) {
       errorResponse(res, 400, 'missing_cwd', '缺少 cwd 参数');
@@ -574,7 +645,7 @@ async function handleWorkspacesCreate(req, res) {
 
 async function handleWorkspacesRename(req, res) {
   try {
-    const body = await readBoundedRequestBody(req);
+    const body = await readJsonBody(req);
     const { id, displayName } = body;
     if (!id || displayName === undefined) {
       errorResponse(res, 400, 'missing_params', '缺少 id 或 displayName 参数');
@@ -590,7 +661,7 @@ async function handleWorkspacesRename(req, res) {
 
 async function handleWorkspacesDelete(req, res) {
   try {
-    const body = await readBoundedRequestBody(req);
+    const body = await readJsonBody(req);
     const { id } = body;
     if (!id) {
       errorResponse(res, 400, 'missing_id', '缺少 id 参数');
@@ -625,7 +696,7 @@ async function handleTabsList(req, res, parsedUrl) {
 async function handleTabsCreate(req, res, parsedUrl) {
   try {
     const cwd = decodeURIComponent(parsedUrl.pathname.split('/')[3]);
-    const body = await readBoundedRequestBody(req).catch(() => ({}));
+    const body = await readJsonBody(req).catch(() => ({}));
     const result = createSession({ cwd, ...body });
     if (!result.ok) {
       errorResponse(res, 400, 'pty_create_failed', result.error || '创建终端失败');

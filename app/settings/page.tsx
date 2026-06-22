@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
-import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import {
   listConversationSources,
   addConversationSource,
@@ -17,14 +17,13 @@ type Status = 'idle' | 'adding' | 'removing' | 'syncing' | 'error';
  * 添加/移除/同步对话源
  */
 export default function SettingsPage() {
-  const router = useRouter();
   const [sources, setSources] = useState<ConversationSource[]>([]);
   const [status, setStatus] = useState<Status>('idle');
   const [error, setError] = useState<string | null>(null);
 
   // 表单状态
   const [path, setPath] = useState('');
-  const [agentType, setAgentType] = useState<'claude' | 'pi' | 'codex'>('claude');
+  const [agentType, setAgentType] = useState<'claude' | 'pi' | 'codex' | 'opencode'>('claude');
   const [label, setLabel] = useState('');
 
   const loadSources = useCallback(async () => {
@@ -37,7 +36,7 @@ export default function SettingsPage() {
   }, []);
 
   useEffect(() => {
-    loadSources();
+    queueMicrotask(() => { void loadSources(); });
   }, [loadSources]);
 
   const handleAdd = async (e: React.FormEvent) => {
@@ -99,16 +98,16 @@ export default function SettingsPage() {
     <div className="min-h-screen w-full flex flex-col">
       <header className="w-full px-6 py-4 flex items-center justify-between border-b border-[color:var(--color-border-subtle)]">
         <div className="flex items-center gap-2.5">
-          <a href="/" className="flex items-center gap-2 text-sm hover:opacity-80 transition-opacity">
+          <Link href="/" className="flex items-center gap-2 text-sm hover:opacity-80 transition-opacity">
             <Logo />
             <span className="font-semibold tracking-tight">nterminal</span>
-          </a>
+          </Link>
           <span className="text-[color:var(--color-fg-quaternary)] text-xs">·</span>
           <h1 className="text-sm text-[color:var(--color-fg-secondary)]">设置</h1>
         </div>
-        <a href="/" className="nav-link" data-testid="back-home">
+        <Link href="/" className="nav-link" data-testid="back-home">
           ← 返回
-        </a>
+        </Link>
       </header>
 
       <main className="flex-1 w-full max-w-3xl mx-auto px-6 py-8 flex flex-col gap-8">
@@ -156,13 +155,14 @@ export default function SettingsPage() {
                 </label>
                 <select
                   value={agentType}
-                  onChange={(e) => setAgentType(e.target.value as 'claude' | 'pi' | 'codex')}
+                  onChange={(e) => setAgentType(e.target.value as 'claude' | 'pi' | 'codex' | 'opencode')}
                   className="input-mono"
                   data-testid="source-agent-type"
                 >
                   <option value="claude">Claude Code</option>
                   <option value="pi">pi-mono</option>
                   <option value="codex">Codex</option>
+                  <option value="opencode">OpenCode</option>
                 </select>
               </div>
 

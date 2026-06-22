@@ -156,7 +156,7 @@ export interface CompletionItem {
 export interface ConversationSource {
   id: string;
   path: string;
-  agentType: 'claude' | 'pi' | 'codex';
+  agentType: 'claude' | 'pi' | 'codex' | 'opencode';
   label: string | null;
   lastSyncedAt: string | null;
   recordCount: number;
@@ -173,7 +173,16 @@ export interface ConversationRecord {
   toolCalls: string | null;
   toolCallId: string | null;
   metadata: string | null;
+  userText: string | null;
   endedAt: string | null;
+  createdAt: string;
+  cwd: string | null;
+}
+
+export interface ConversationSearchItem {
+  conversation: ConversationRecord;
+  snippet: string | null;
+  rank: number;
 }
 
 // ---- API 请求/响应类型 ----

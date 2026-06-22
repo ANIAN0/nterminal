@@ -12,7 +12,7 @@
  *   5. tool part 作为独立的 tool 记录
  */
 
-import Database from 'better-sqlite3';
+import { Database } from '@tursodatabase/database/compat';
 import { normalizeRole } from './_shared/role-mapper.mjs';
 
 /**
@@ -22,7 +22,7 @@ import { normalizeRole } from './_shared/role-mapper.mjs';
  * @returns {Array<{ role: string, content: string|null, toolCalls: string|null, toolCallId: string|null, timestamp: string|null }>} 解析结果
  */
 export function parseSessionFile(filePath) {
-  const db = new Database(filePath, { readonly: true, fileMustExist: true });
+  const db = new Database(filePath, { readonly: true });
 
   try {
     // 查询所有 message 按时间排序

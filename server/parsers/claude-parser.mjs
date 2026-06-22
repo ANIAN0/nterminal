@@ -13,7 +13,7 @@
  *   timestamp 字段为毫秒时间戳。
  */
 
-import { readFileSync, statSync, readdirSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { normalizeRole } from './_shared/role-mapper.mjs';
 
@@ -108,6 +108,18 @@ function extractTextFromContent(content) {
  */
 export function parseSessionFile(filePath) {
   const entries = readJsonl(filePath);
+  if (entries.some((entry) => typeof entry?.display === 'string')) {
+    // history.jsonl 没有 type/message 包装，直接转换为用户消息。
+    return entries
+      .filter((entry) => typeof entry?.display === 'string' && entry.display.trim())
+      .map((entry) => ({
+        role: 'user',
+        content: entry.display,
+        toolCalls: null,
+        toolCallId: null,
+        timestamp: msToIso(entry.timestamp),
+      }));
+  }
   const results = [];
 
   for (const entry of entries) {

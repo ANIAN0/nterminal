@@ -12,7 +12,6 @@
 import pty from 'node-pty';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { resolve as resolvePath } from 'node:path';
 import { validateCwd, checkDirectoryExists } from './validation.mjs';
 
 const sessions = new Map();
@@ -419,7 +418,7 @@ export function startSweeper(intervalMs = 30000, ttlMs = 60000) {
 
   sweeperTimer = setInterval(() => {
     const now = Date.now();
-    for (const [id, session] of sessions) {
+    for (const session of sessions.values()) {
       if (session.status !== 'running') continue;
       if (now - session.lastSeenAt > ttlMs) {
         // 超时，kill PTY
@@ -455,7 +454,7 @@ export function getPreview(sessionId) {
   return session.ringBuffer.join('\n');
 }
 
-export default {
+const ptyManager = {
   createSession,
   getSession,
   getPtyProcess,
@@ -473,3 +472,5 @@ export default {
   touchSession,
   getPreview,
 };
+
+export default ptyManager;

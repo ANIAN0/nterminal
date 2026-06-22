@@ -179,7 +179,7 @@ export function createTerminalObserver({
     clearIdle();
     let assistantText = '';
     try { assistantText = snapshotReply(); }
-    catch (err) { assistantText = ''; /* snapshot 异常不阻断 finalize */ }
+    catch { assistantText = ''; /* snapshot 异常不阻断 finalize */ }
     const payload = {
       assistantText,
       userTextFromOsc,

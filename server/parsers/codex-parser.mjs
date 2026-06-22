@@ -74,15 +74,11 @@ export function parseSessionFile(filePath) {
   const results = [];
 
   // 第一遍：提取 session 元数据
-  let sessionId = null;
-  let sessionCwd = null;
   let sessionTimestamp = null;
 
   for (const entry of entries) {
     if (entry.type === 'session_meta') {
       const payload = entry.payload || entry;
-      sessionId = payload.id || null;
-      sessionCwd = payload.cwd || null;
       sessionTimestamp = payload.timestamp || null;
       break;
     }
