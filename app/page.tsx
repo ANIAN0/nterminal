@@ -1,5 +1,5 @@
-import PathEntryPage from './components/PathEntryPage';
+import HomePage from './components/HomePage';
 
 export default function Home() {
-  return <PathEntryPage />;
+  return <HomePage />;
 }

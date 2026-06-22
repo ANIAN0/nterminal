@@ -2,8 +2,8 @@
 
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
-import { ApiError, getRecordDetail } from '../lib/api';
-import type { InteractionRecord } from '../lib/types';
+import { postJson } from '../lib/api';
+import type { ConversationRecord } from '../lib/types';
 import { stripAnsi } from '../lib/text';
 
 function relativeTime(iso: string): string {
@@ -36,6 +36,8 @@ export default function HistoryDetailPage({ recordId }: { recordId: string }) {
   const [notFound, setNotFound] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [showRaw, setShowRaw] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     if (!recordId) return;
@@ -114,6 +116,25 @@ export default function HistoryDetailPage({ recordId }: { recordId: string }) {
 
   if (!record) return null;
 
+  const cleaned = record.outputTextClean ?? '';
+  const hasCleaned = typeof record.outputTextClean === 'string' && cleaned.length > 0;
+  const outputDisplay = showRaw || !hasCleaned
+    ? (stripAnsi(record.outputText) || '')
+    : cleaned;
+
+  async function handleDelete() {
+    if (!record) return;
+    if (!window.confirm('确定删除此记录？删除后不可恢复。')) return;
+    setDeleting(true);
+    try {
+      await deleteRecord({ recordId: record.id });
+      router.push('/history');
+    } catch (err) {
+      setDeleting(false);
+      setError(err instanceof Error ? err.message : '删除失败');
+    }
+  }
+
   return (
     <div className="min-h-screen w-full flex flex-col">
       <TopBar onBack={() => router.push('/history')} />
@@ -124,14 +145,25 @@ export default function HistoryDetailPage({ recordId }: { recordId: string }) {
             <span className="chip mono text-[10px]" style={{ color: endStateColor(record.endState) }}>
               {record.endState}
             </span>
-            <span className="chip mono text-[10px]" title={record.recordId || record.id}>
-              {(record.recordId || record.id || '').slice(0, 8)}…
+            <span className="chip mono text-[10px]" title={record.id}>
+              {(record.id || '').slice(0, 8)}…
             </span>
             <span className="text-[11px] text-[color:var(--color-fg-tertiary)] ml-auto">
               {relativeTime(record.startedAt)}
             </span>
           </div>
-          <h1 className="text-2xl font-semibold tracking-tight">记录详情</h1>
+          <div className="flex items-center justify-between gap-3">
+            <h1 className="text-2xl font-semibold tracking-tight">记录详情</h1>
+            <button
+              type="button"
+              onClick={handleDelete}
+              disabled={deleting}
+              className="btn-ghost text-[color:var(--color-accent-danger)] text-xs"
+              data-testid="delete-record"
+            >
+              {deleting ? '删除中…' : '删除此记录'}
+            </button>
+          </div>
         </section>
 
         {/* metadata chips 网格 */}
@@ -157,12 +189,25 @@ export default function HistoryDetailPage({ recordId }: { recordId: string }) {
 
         {/* outputText */}
         <section className="flex flex-col gap-2">
-          <SectionHeader label="outputText" accent="var(--color-accent)" />
+          <div className="flex items-center justify-between gap-2">
+            <SectionHeader label="outputText" accent="var(--color-accent)" />
+            {hasCleaned && (
+              <button
+                type="button"
+                onClick={() => setShowRaw((v) => !v)}
+                className="chip text-[10px] cursor-pointer hover:opacity-80 transition-opacity"
+                data-testid="toggle-raw"
+                title="切换 清理版 / 原始 stripAnsi"
+              >
+                {showRaw ? '原始（stripAnsi）' : '清理版（TUI 去重）'}
+              </button>
+            )}
+          </div>
           <pre
             className="glass-panel px-3 py-3 text-[13px] whitespace-pre-wrap break-words mono text-[color:var(--color-fg-primary)] overflow-x-auto max-h-[60vh]"
             data-testid="output-text"
           >
-            {stripAnsi(record.outputText) || <span className="text-[color:var(--color-fg-quaternary)]">(空)</span>}
+            {outputDisplay || <span className="text-[color:var(--color-fg-quaternary)]">(空)</span>}
           </pre>
         </section>
       </main>

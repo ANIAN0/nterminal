@@ -9,15 +9,25 @@ import {
   useState,
 } from 'react';
 import { useRouter } from 'next/navigation';
-import { Terminal } from '@wterm/react';
-import { searchRecords } from '../lib/api';
-import type { RecordSearchItem } from '../lib/types';
+import { Terminal, type TerminalHandle } from '@wterm/react';
+import type { WTerm } from '@wterm/dom';
+import { searchRecords, queryCompletion, createSession, killSession, listSessions } from '../lib/api';
+import type { RecordSearchItem, CompletionItem, TabInfo, Workspace, SessionInfo } from '../lib/types';
+import { MAX_TABS } from '../lib/types';
+import CompletionPanel from './CompletionPanel';
+import TabBar from './TabBar';
+import WorkspaceSidebar from './WorkspaceSidebar';
 
-// 状态机：设计 4.6 终端页 11 态
+// 状态机：终端页状态
 type WsStatus = 'connecting' | 'running' | 'exited' | 'error';
 type MatchStatus = 'idle' | 'match_pending' | 'match_results' | 'match_empty' | 'match_error' | 'cancelled';
 
 const SEARCH_DEBOUNCE_MS = 150;
+const COMPLETION_DEBOUNCE_MS = 150;
+// MAX_TABS 来源统一在 lib/types.ts（与后端 session_limit_reached=8 对齐）
+// 标签状态（tab.id 与后端 PTY sessionId 一致）做 sessionStorage 恢复
+// 注意：刷新页面后只恢复 activeTabId，不重建后端 PTY。
+const STORAGE_KEY_ACTIVE_TAB = 'nterminal_active_tab';
 
 function isPrintable(ch: string): boolean {
   return ch >= ' ' && ch !== '\x1b' && ch !== '\x7f';
@@ -33,12 +43,47 @@ function looksLikeJsonEnvelope(s: string): boolean {
   }
 }
 
+/**
+ * 派生标签名：优先用 cwd 的最后一段（如 "…/my-tool" → "my-tool"），
+ * 兜底用 sessionId 前 8 位。
+ */
+function deriveTabLabel(s: { id: string; cwd?: string }): string {
+  if (s.cwd) {
+    const parts = s.cwd.split(/[\\/]/).filter(Boolean);
+    const last = parts[parts.length - 1];
+    if (last) return last;
+  }
+  return s.id.slice(0, 8);
+}
+
+/**
+ * 合并 tabs：
+ * - live（来自 /api/session/list 的真值）覆盖相同 id 的条目（cwd/status 用后端权威值）
+ * - prev 里独有的条目保留（如尚未在后端列表中上报的、刚创建还未 ready 的）
+ * - seedSessionId（URL 上的）保证至少有一个 tab
+ */
+function mergeTabs(prev: TabInfo[], live: TabInfo[], seedSessionId: string): TabInfo[] {
+  const byId = new Map<string, TabInfo>();
+  for (const t of prev) byId.set(t.id, t);
+  for (const t of live) byId.set(t.id, t);
+  if (seedSessionId && !byId.has(seedSessionId)) {
+    byId.set(seedSessionId, { id: seedSessionId, label: seedSessionId.slice(0, 8), status: 'connecting' });
+  }
+  return Array.from(byId.values());
+}
+
 export default function TerminalWorkspace({ sessionId }: { sessionId: string }) {
   const router = useRouter();
-  const terminalRef = useRef<{ write?: (data: string) => void } | null>(null);
+  const terminalRef = useRef<TerminalHandle | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+
+  // IME 光标锚定（#2/#9）：把 wterm 内部隐藏 textarea 移到真实光标像素位置，
+  // 使拼音候选窗跟随光标、且消除离屏 textarea 触发的页面跳动。
+  const wtRef = useRef<WTerm | null>(null);
+  const imeRafRef = useRef<number | null>(null);
+  const charWidthRef = useRef<number>(0);
 
   const [inputBuffer, setInputBuffer] = useState('');
   const deferredBuffer = useDeferredValue(inputBuffer);
@@ -49,11 +94,114 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
   const [searchResults, setSearchResults] = useState<RecordSearchItem[]>([]);
   const [matchStatus, setMatchStatus] = useState<MatchStatus>('idle');
 
-  // ---- WS 连接 ----
+  // ---- 补全状态 ----
+  const [completionItems, setCompletionItems] = useState<CompletionItem[]>([]);
+  const [completionHighlight, setCompletionHighlight] = useState(-1);
+  const [showCompletion, setShowCompletion] = useState(false);
+  const completionDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ---- 标签状态（sessionStorage 恢复） ----
+  // tab.id 必须等于后端 PTY sessionId（C-009 隐含约束，本期明确化）
+  const [tabs, setTabs] = useState<TabInfo[]>(() => {
+    if (typeof window === 'undefined') return [];
+    try {
+      const stored = sessionStorage.getItem(STORAGE_KEY_ACTIVE_TAB);
+      // 新格式只存 activeTabId；tabs 列表从 /api/session/list 重建
+      return [];
+    } catch {
+      return [];
+    }
+  });
+  const [activeTabId, setActiveTabId] = useState<string>(() => {
+    if (typeof window === 'undefined') return sessionId;
+    try {
+      const stored = sessionStorage.getItem(STORAGE_KEY_ACTIVE_TAB);
+      // 优先用 URL 的 sessionId（路由语义优先），否则用上次活跃
+      return sessionId || (stored ?? '');
+    } catch {
+      return sessionId;
+    }
+  });
+
+  // ---- 工作区状态（纯内存，与 C-010 一致，不持久化） ----
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+
+  // ---- 持久化：仅存 activeTabId ----
   useEffect(() => {
-    if (!sessionId) return;
+    if (activeTabId) {
+      sessionStorage.setItem(STORAGE_KEY_ACTIVE_TAB, activeTabId);
+    }
+  }, [activeTabId]);
+
+  // tabsRef 供 close 等需要在闭包里读到最新 tabs 列表的场景使用
+  const tabsRef = useRef<TabInfo[]>([]);
+  useEffect(() => { tabsRef.current = tabs; }, [tabs]);
+  // activeTabIdRef 用于 setTabs 等函数式回调里读到最新 activeTabId（避免闭包过期）
+  const activeTabIdRef = useRef<string>('');
+  useEffect(() => { activeTabIdRef.current = activeTabId; }, [activeTabId]);
+
+  // ---- 初次挂载：拉取后端活跃会话，初始化 tabs ----
+  // （页面刷新或直访 /terminal?sessionId=xxx 时落地）
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await listSessions();
+        if (cancelled) return;
+        // 后端活跃列表里的都视为"已 ready"，保留它们的 id/cwd
+        const live: TabInfo[] = r.sessions.map((s) => ({
+          id: s.id,
+          label: deriveTabLabel(s),
+          status: 'ready',
+          cwd: s.cwd,
+        }));
+        setTabs((prev) => mergeTabs(prev, live, sessionId));
+      } catch (err) {
+        // 拉取失败不阻塞页面（可能是首次启动无活跃会话）
+        if (!cancelled) console.warn('listSessions failed', err);
+      }
+    })();
+    return () => { cancelled = true; };
+    // 仅首次挂载执行
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---- WS 连接：跟随 activeTabId 切换 PTY ----
+  useEffect(() => {
+    if (!activeTabId) return;
+
+    // 切标签时清理上一个 PTY 的 UI 状态，防止输入/补全/搜索状态泄漏到新 PTY
+    setInputBuffer('');
+    setSearchResults([]);
+    setMatchStatus('idle');
+    setShowCompletion(false);
+    setCompletionItems([]);
+    setCompletionHighlight(-1);
+    // 取消进行中的搜索/补全 debounce 与 fetch
+    if (debounceRef.current) {
+      clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+    if (completionDebounceRef.current) {
+      clearTimeout(completionDebounceRef.current);
+      completionDebounceRef.current = null;
+    }
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
+    }
+    // 切到新 PTY 前先清屏（避免上一个 PTY 的输出残留）
+    // 等 wterm 真正 ready 之后再清，避免 onReady 还没触发就 write
+    const clearOnceReady = () => {
+      terminalRef.current?.write?.('\x1b[2J\x1b[3J\x1b[H');
+    };
+    // 立即尝试一次（多数情况下 wterm 已 ready），延迟再尝试兜底
+    clearOnceReady();
+    const clearTimer = setTimeout(clearOnceReady, 80);
+
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${protocol}//${window.location.host}/ws/pty/${sessionId}`;
+    const url = `${protocol}//${window.location.host}/ws/pty/${activeTabId}`;
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
     wsRef.current = ws;
@@ -62,14 +210,21 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
     ws.onopen = () => {
       setWsStatus('running');
       setError(null);
+      // 同步 tab 状态
+      setTabs((prev) => prev.map((t) => (t.id === activeTabId ? { ...t, status: 'ready' } : t)));
     };
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       setWsStatus('exited');
       setError(null);
+      // 404/409 等异常关闭时把 tab 标为 exited（保留只读视图）
+      if (ev.code !== 1000) {
+        setTabs((prev) => prev.map((t) => (t.id === activeTabId ? { ...t, status: 'exited' } : t)));
+      }
     };
     ws.onerror = () => {
       setWsStatus('error');
       setError('WS 连接错误');
+      setTabs((prev) => prev.map((t) => (t.id === activeTabId ? { ...t, status: 'error' } : t)));
     };
     ws.onmessage = async (ev) => {
       const data = ev.data;
@@ -90,9 +245,10 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
     };
 
     return () => {
+      clearTimeout(clearTimer);
       ws.close();
     };
-  }, [sessionId]);
+  }, [activeTabId]);
 
   // ---- 搜索：inputBuffer 变化触发 debounced search ----
   useEffect(() => {
@@ -140,6 +296,16 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
     };
   }, [deferredBuffer]);
 
+  // ---- IME 锚定清理 ----
+  useEffect(() => {
+    return () => {
+      if (imeRafRef.current != null) cancelAnimationFrame(imeRafRef.current);
+      imeRafRef.current = null;
+      const cleanup = (wtRef as unknown as { _imeCleanup?: () => void })._imeCleanup;
+      if (cleanup) cleanup();
+    };
+  }, []);
+
   // ---- 字符 → PTY ----
   const handleTerminalData = useCallback((data: string) => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -164,6 +330,283 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ _ctrl: { type: 'resize', cols, rows } }));
     }
+  }, []);
+
+  // ---- 补全查询（debounce） ----
+  useEffect(() => {
+    if (completionDebounceRef.current) clearTimeout(completionDebounceRef.current);
+
+    if (deferredBuffer.length < 2) {
+      setShowCompletion(false);
+      setCompletionItems([]);
+      return;
+    }
+
+    completionDebounceRef.current = setTimeout(async () => {
+      try {
+        const r = await queryCompletion({ prefix: deferredBuffer, limit: 8 });
+        if (r.items.length > 0) {
+          setCompletionItems(r.items);
+          setCompletionHighlight(0);
+          setShowCompletion(true);
+        } else {
+          setShowCompletion(false);
+          setCompletionItems([]);
+        }
+      } catch {
+        setShowCompletion(false);
+      }
+    }, COMPLETION_DEBOUNCE_MS);
+
+    return () => {
+      if (completionDebounceRef.current) clearTimeout(completionDebounceRef.current);
+    };
+  }, [deferredBuffer]);
+
+  // ---- 补全选择 ----
+  const handleCompletionSelect = useCallback((text: string) => {
+    setInputBuffer(text);
+    setShowCompletion(false);
+    setCompletionItems([]);
+  }, []);
+
+  const handleCompletionCancel = useCallback(() => {
+    setShowCompletion(false);
+    setCompletionItems([]);
+  }, []);
+
+  // 鼠标 hover 同步高亮索引，让键盘高亮与鼠标悬停互通
+  const handleCompletionHover = useCallback((index: number) => {
+    setCompletionHighlight(index);
+  }, []);
+
+  // ---- 键盘导航（补全面板） ----
+  const handleCompletionKeyDown = useCallback(
+    (e: KeyboardEvent) => {
+      if (!showCompletion || completionItems.length === 0) return;
+
+      switch (e.key) {
+        case 'Tab':
+          e.preventDefault();
+          if (completionHighlight < completionItems.length - 1) {
+            setCompletionHighlight((prev) => prev + 1);
+          }
+          break;
+        case 'ArrowDown':
+          e.preventDefault();
+          setCompletionHighlight((prev) =>
+            prev < completionItems.length - 1 ? prev + 1 : 0,
+          );
+          break;
+        case 'ArrowUp':
+          e.preventDefault();
+          setCompletionHighlight((prev) =>
+            prev > 0 ? prev - 1 : completionItems.length - 1,
+          );
+          break;
+        case 'Enter':
+          e.preventDefault();
+          if (completionHighlight >= 0 && completionHighlight < completionItems.length) {
+            handleCompletionSelect(completionItems[completionHighlight].userText);
+          }
+          break;
+        case 'Escape':
+          e.preventDefault();
+          handleCompletionCancel();
+          break;
+      }
+    },
+    [showCompletion, completionItems, completionHighlight, handleCompletionSelect, handleCompletionCancel],
+  );
+
+  // ---- 补全键盘导航 ----
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (showCompletion && completionItems.length > 0) {
+        handleCompletionKeyDown(e);
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [showCompletion, completionItems, handleCompletionKeyDown]);
+
+  // ---- 标签管理 ----
+  // 标签 = PTY 会话；handleTabCreate 调 createSession，handleTabClose 调 killSession。
+  // cwd 缺省用 process.cwd()（后端 handleCreateSession 的兜底）。
+  const handleTabSelect = useCallback((id: string) => {
+    setActiveTabId(id);
+  }, []);
+
+  const handleTabClose = useCallback(async (id: string) => {
+    // 用 setTabs 函数式回调同步推导新的 activeTabId，避免依赖 tabsRef 时序
+    let nextActiveId: string | null = null;
+    setTabs((prev) => {
+      const remaining = prev.filter((t) => t.id !== id);
+      // 关闭的就是当前活跃时，回退到首个剩余标签
+      if (id === activeTabIdRef.current) {
+        nextActiveId = remaining[0]?.id ?? null;
+      }
+      return remaining;
+    });
+    // 工作区里同步清掉这个 sessionId
+    setWorkspaces((prev) =>
+      prev.map((ws) => ({ ...ws, sessionIds: ws.sessionIds.filter((sid) => sid !== id) })),
+    );
+    // 同步切到下一个活跃（如果有），避免短暂指向已关闭 tab
+    if (nextActiveId !== null) {
+      setActiveTabId(nextActiveId ?? '');
+    }
+    // 后端杀进程（失败也不阻塞 UI；后端进程可能早已退出）
+    try {
+      await killSession(id);
+    } catch (err) {
+      console.warn('killSession failed', err);
+    }
+  }, []);
+
+  const handleTabCreate = useCallback(async () => {
+    if (tabs.length >= MAX_TABS) return;
+    try {
+      const { session } = await createSession({ cwd: '' });
+      const newTab: TabInfo = {
+        id: session.id,
+        label: deriveTabLabel(session),
+        status: 'connecting',
+        cwd: session.cwd,
+      };
+      setTabs((prev) => [...prev, newTab]);
+      setActiveTabId(newTab.id);
+    } catch (err) {
+      console.error('createSession failed', err);
+      setError(err instanceof Error ? err.message : '创建标签失败');
+    }
+  }, [tabs.length]);
+
+  // 侧边栏点击会话 = 切换到对应标签
+  const handleSessionSelect = useCallback((id: string) => {
+    setActiveTabId(id);
+  }, []);
+
+  // ---- 工作区管理 ----
+  const handleWorkspaceCreate = useCallback((name: string) => {
+    const ws: Workspace = {
+      id: crypto.randomUUID(),
+      name,
+      sessionIds: [],
+    };
+    setWorkspaces((prev) => [...prev, ws]);
+  }, []);
+
+  const handleWorkspaceRename = useCallback((id: string, name: string) => {
+    setWorkspaces((prev) =>
+      prev.map((ws) => (ws.id === id ? { ...ws, name } : ws)),
+    );
+  }, []);
+
+  const handleWorkspaceDelete = useCallback((id: string) => {
+    if (!confirm('确定删除此工作区？')) return;
+    setWorkspaces((prev) => prev.filter((ws) => ws.id !== id));
+  }, []);
+
+  const handleSessionDrop = useCallback((sessionId: string, workspaceId: string) => {
+    setWorkspaces((prev) =>
+      prev.map((ws) =>
+        ws.id === workspaceId && !ws.sessionIds.includes(sessionId)
+          ? { ...ws, sessionIds: [...ws.sessionIds, sessionId] }
+          : ws,
+      ),
+    );
+  }, []);
+
+  // 测量单字符宽度（monospace），用于把 textarea 锚定到光标列。
+  function measureCharWidth(wt: WTerm): number {
+    try {
+      const row = document.createElement('div');
+      row.className = 'term-row';
+      row.style.visibility = 'hidden';
+      row.style.position = 'absolute';
+      const probe = document.createElement('span');
+      probe.textContent = 'W';
+      row.appendChild(probe);
+      wt.element.appendChild(row);
+      const w = probe.getBoundingClientRect().width;
+      row.remove();
+      if (w > 0) return w;
+    } catch { /* ignore */ }
+    return 0;
+  }
+
+  // 每帧把隐藏 textarea 移到当前光标像素位置（仅终端聚焦时）。
+  function repositionImeTextarea(wt: WTerm) {
+    const ta = wt.element.querySelector('textarea');
+    if (!ta) return;
+    const bridge = wt.bridge;
+    if (!bridge) return;
+    const focused = wt.element.classList.contains('focused');
+    if (!focused) return;
+    const cursor = bridge.getCursor();
+    const rowH = (wt as unknown as { _rowHeight?: number })._rowHeight || 18;
+    let charW = charWidthRef.current || measureCharWidth(wt);
+    if (charW > 0) charWidthRef.current = charW;
+    if (!cursor || !cursor.visible || charW <= 0) return;
+    const cs = getComputedStyle(wt.element);
+    const padL = parseFloat(cs.paddingLeft) || 0;
+    const padT = parseFloat(cs.paddingTop) || 0;
+    let left = padL + cursor.col * charW;
+    let top = padT + cursor.row * rowH;
+    // 夹在可视区内，避免越界触发滚动
+    const maxLeft = Math.max(0, wt.element.clientWidth - charW - padL);
+    const maxTop = Math.max(0, wt.element.clientHeight - rowH - padT);
+    if (left > maxLeft) left = maxLeft;
+    if (top > maxTop) top = maxTop;
+    const s = ta.style;
+    s.left = `${Math.round(left)}px`;
+    s.top = `${Math.round(top)}px`;
+    s.width = `${Math.round(charW)}px`;
+    s.height = `${Math.round(rowH)}px`;
+  }
+
+  const handleTerminalReady = useCallback((wt: WTerm) => {
+    wtRef.current = wt;
+    charWidthRef.current = 0; // 容器尺寸/字体变化后重测
+    measureCharWidth(wt);
+    const ta = wt.element.querySelector('textarea');
+    const tick = () => {
+      const w = wtRef.current;
+      if (!w) return;
+      repositionImeTextarea(w);
+      imeRafRef.current = requestAnimationFrame(tick);
+    };
+    const start = () => {
+      if (imeRafRef.current == null) {
+        // 立即定位一次，再启动循环
+        repositionImeTextarea(wt);
+        imeRafRef.current = requestAnimationFrame(tick);
+      }
+    };
+    const stop = () => {
+      if (imeRafRef.current != null) {
+        cancelAnimationFrame(imeRafRef.current);
+        imeRafRef.current = null;
+      }
+    };
+    if (ta) {
+      ta.addEventListener('focus', start);
+      ta.addEventListener('blur', stop);
+    }
+    // 清理句柄挂到 wtRef 上以便卸载时移除
+    (wtRef as unknown as { _imeCleanup?: () => void })._imeCleanup = () => {
+      stop();
+      if (ta) {
+        ta.removeEventListener('focus', start);
+        ta.removeEventListener('blur', stop);
+      }
+    };
+  }, []);
+
+  // 清屏：清 wterm 可视区 + scrollback（不触碰 PTY 状态，prompt 下次输出重绘）
+  const handleClearScreen = useCallback(() => {
+    terminalRef.current?.write?.('\x1b[2J\x1b[3J\x1b[H');
   }, []);
 
   const inputStatus: 'input_idle' | 'editing' = inputBuffer.length > 0 ? 'editing' : 'input_idle';
@@ -209,41 +652,70 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
     );
   }
 
-  return (
-    <div className="flex flex-col h-screen overflow-hidden">
-      {/* 顶部 chrome —— 深色磨砂 + 状态 pill */}
-      <header
-        className="flex items-center justify-between px-4 py-2 border-b border-[color:var(--color-border-subtle)] bg-[color:var(--color-bg-panel-strong)] backdrop-blur-md"
-        style={{ WebkitBackdropFilter: 'blur(10px)' }}
-      >
-        <div className="flex items-center gap-3">
-          <a href="/" className="flex items-center gap-2 text-sm hover:opacity-80 transition-opacity" aria-label="返回首页">
-            <TerminalLogo />
-            <span className="font-semibold tracking-tight">nterminal</span>
-          </a>
-          <span className="text-[color:var(--color-fg-quaternary)] text-xs">·</span>
-          <span className={wsPillClass} data-testid="status">
-            <span className="dot" />
-            {wsStatusText}
-          </span>
-          <span className="chip mono text-[10px]" title={sessionId} data-testid="session-id">
-            {sessionId.slice(0, 8)}…
-          </span>
-        </div>
+  // 把真实 tabs 投影成 sidebar 需要的 {id,label} 形状（按 cwd 派生的可读标签）
+  const sidebarSessions = tabs.map((t) => ({ id: t.id, label: t.label }));
 
-        <div className="flex items-center gap-3 text-sm">
-          <div className="flex items-center gap-2 text-[color:var(--color-fg-tertiary)]">
-            <span className="text-[11px] uppercase tracking-[0.1em]">input</span>
-            <code
-              className="mono px-2 py-0.5 rounded-md bg-[rgba(255,255,255,0.04)] border border-[color:var(--color-border-subtle)] text-[color:var(--color-fg-primary)] text-[12px] min-w-[80px] inline-block truncate max-w-[260px]"
-              data-testid="input-buffer"
-            >
-              {inputBuffer || <span className="text-[color:var(--color-fg-quaternary)]">(空)</span>}
-            </code>
-            <span className="chip text-[10px]" data-testid="input-status">
-              {inputStatus === 'editing' ? '编辑中' : '空闲'}
+  return (
+    <div className="flex h-screen overflow-hidden">
+      {/* 左侧工作区侧边栏 —— sessions 用真实 PTY id，tab.id === sessionId */}
+      <WorkspaceSidebar
+        workspaces={workspaces}
+        sessions={sidebarSessions}
+        onWorkspaceCreate={handleWorkspaceCreate}
+        onWorkspaceRename={handleWorkspaceRename}
+        onWorkspaceDelete={handleWorkspaceDelete}
+        onSessionDrop={handleSessionDrop}
+        onSessionSelect={handleSessionSelect}
+        collapsed={sidebarCollapsed}
+        onToggleCollapse={() => setSidebarCollapsed((p) => !p)}
+      />
+
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* 顶部 chrome —— 深色磨砂 + 状态 pill */}
+        <header
+          className="flex items-center justify-between px-4 py-2 border-b border-[color:var(--color-border-subtle)] bg-[color:var(--color-bg-panel-strong)] backdrop-blur-md"
+          style={{ WebkitBackdropFilter: 'blur(10px)' }}
+        >
+          <div className="flex items-center gap-3">
+            <a href="/" className="flex items-center gap-2 text-sm hover:opacity-80 transition-opacity" aria-label="返回首页">
+              <TerminalLogo />
+              <span className="font-semibold tracking-tight">nterminal</span>
+            </a>
+            <span className="text-[color:var(--color-fg-quaternary)] text-xs">·</span>
+            <span className={wsPillClass} data-testid="status">
+              <span className="dot" />
+              {wsStatusText}
             </span>
+            <a
+              href="/settings"
+              className="text-[11px] text-[color:var(--color-fg-tertiary)] hover:text-[color:var(--color-fg-primary)] transition-colors"
+            >
+              设置
+            </a>
           </div>
+
+          <div className="flex items-center gap-3 text-sm">
+            <div className="flex items-center gap-2 text-[color:var(--color-fg-tertiary)]">
+              <span className="text-[11px] uppercase tracking-[0.1em]">input</span>
+              <code
+                className="mono px-2 py-0.5 rounded-md bg-[rgba(255,255,255,0.04)] border border-[color:var(--color-border-subtle)] text-[color:var(--color-fg-primary)] text-[12px] min-w-[80px] inline-block truncate max-w-[260px]"
+                data-testid="input-buffer"
+              >
+                {inputBuffer || <span className="text-[color:var(--color-fg-quaternary)]">(空)</span>}
+              </code>
+              <span className="chip text-[10px]" data-testid="input-status">
+                {inputStatus === 'editing' ? '编辑中' : '空闲'}
+              </span>
+            </div>
+            <button
+              type="button"
+            onClick={handleClearScreen}
+            className="chip text-[10px] cursor-pointer hover:opacity-80 transition-opacity"
+            data-testid="clear-screen"
+            title="清空终端可视区与回滚缓冲（不影响 PTY）"
+          >
+            清屏
+          </button>
         </div>
       </header>
 
@@ -258,6 +730,15 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
         </div>
       )}
 
+      {/* 标签栏 */}
+      <TabBar
+        tabs={tabs}
+        activeTabId={activeTabId}
+        onTabSelect={handleTabSelect}
+        onTabClose={handleTabClose}
+        onTabCreate={handleTabCreate}
+      />
+
       {/* 终端主体 —— 居中卡片 */}
       <div className="flex-1 relative p-3 sm:p-5 flex items-stretch justify-center min-h-0">
         <div className="poc-terminal w-full max-w-[1100px]">
@@ -265,9 +746,34 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
             ref={terminalRef}
             onData={handleTerminalData}
             onResize={handleTerminalResize}
+            onReady={handleTerminalReady}
             className="h-full"
           />
         </div>
+
+        {/* 补全面板（输入框下方） */}
+        {showCompletion && completionItems.length > 0 && (
+          <div
+            className="absolute bottom-3 left-3 sm:left-5 w-[340px] max-h-[300px] flex flex-col overflow-hidden rounded-xl border border-[color:var(--color-border-strong)] shadow-2xl"
+            style={{
+              background: 'var(--color-bg-panel-strong)',
+              backdropFilter: 'blur(14px)',
+              WebkitBackdropFilter: 'blur(14px)',
+            }}
+            data-testid="completion-panel"
+          >
+            <div className="px-3 py-2 border-b border-[color:var(--color-border-subtle)]">
+              <span className="text-[11px] text-[color:var(--color-fg-tertiary)]">补全建议</span>
+            </div>
+            <CompletionPanel
+              items={completionItems}
+              onSelect={handleCompletionSelect}
+              onCancel={handleCompletionCancel}
+              onHover={handleCompletionHover}
+              highlightedIndex={completionHighlight}
+            />
+          </div>
+        )}
 
         {/* 命令面板式搜索浮层（参考 warp command_palette / wterm 风格） */}
         {matchStatus !== 'idle' && (
@@ -345,6 +851,7 @@ export default function TerminalWorkspace({ sessionId }: { sessionId: string }) 
         )}
       </div>
     </div>
+  </div>
   );
 }
 

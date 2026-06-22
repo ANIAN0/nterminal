@@ -17,24 +17,14 @@ import { createTerminalObserver } from './server/terminal-observer.mjs';
 import {
   addSessionListener,
   createSession,
+  dispose as disposePtySession,
   getSession,
+  killSession,
   removeSessionListener,
   resize,
   writeToSession,
 } from './server/pty-manager.mjs';
-
-import {
-  beginTurn,
-  appendOutput,
-  finishTurn,
-} from './server/interaction-recorder.mjs';
-
-import {
-  validateAndSave,
-  list as listPathHistory,
-  deletePath,
-  clearAll as clearPathHistory,
-} from './server/path-history-store.mjs';
+import { startSweeper, touchSession, getPreview } from './server/pty-manager.mjs';
 
 import {
   validateCwd,
@@ -43,6 +33,25 @@ import {
   checkDirectoryExists,
   readBoundedRequestBody,
 } from './server/validation.mjs';
+
+import { initializeDatabase, getDb } from './server/database.mjs';
+import {
+  insertConversationSource,
+  listConversationSources,
+  deleteConversationSource as dbDeleteConversationSource,
+  queryCompletion as dbQueryCompletion,
+  listConversations,
+} from './server/database.mjs';
+import { createImportEngine } from './server/conversation-import.mjs';
+import { getActiveSessions } from './server/pty-manager.mjs';
+import { discoverDefaultSources } from './server/startup-discovery.mjs';
+
+// 导入引擎实例（启动流程中初始化，sync API 复用）
+let importEngine = null;
+/** @returns {ReturnType<typeof createImportEngine> | null} */
+export function getImportEngine() {
+  return importEngine;
+}
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = process.env.HOST || 'localhost';
@@ -57,7 +66,6 @@ const OSC_STALE_MS = parseInt(process.env.POC_OSC_STALE_MS || '5000', 10);
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
 const sessionObservers = new Map();
-const activeRecords = new Map(); // sessionId -> recordId
 
 function writeLog(event, data = {}) {
   const line = JSON.stringify({
@@ -108,9 +116,6 @@ async function readJsonBody(req) {
 }
 
 function createObserver(sessionId, ws, sessionMeta) {
-  // P1b：terminal-observer 持有 turn 状态机（OSC 133 + 去抖 + alt-screen 隔离）。
-  // onFinalize 回调在回复 finalize 时触发（OSC 去抖或 idle 兜底），录 agent_reply + finishTurn。
-  // 用 observer 闭包延迟绑定（terminal 需要 onFinalize，onFinalize 需要 observer）。
   const observer = {
     sessionId,
     ws,
@@ -118,8 +123,6 @@ function createObserver(sessionId, ws, sessionMeta) {
     command: sessionMeta?.command || '',
     userBuffer: '',
     hasUserMessage: false,
-    recordId: null,
-    recordFinalized: false,
     terminal: null,
   };
   observer.terminal = createTerminalObserver({
@@ -128,36 +131,23 @@ function createObserver(sessionId, ws, sessionMeta) {
     idleMs: REPLY_IDLE_MS,
     debounceMs: OSC_DEBOUNCE_MS,
     staleMs: OSC_STALE_MS,
-    onFinalize: (text, reason) => onReplyFinalize(observer, text, reason),
+    onFinalize: (text, reason) => {
+      writeLog('reply_finalized', { sessionId, reason, textLength: text.length });
+    },
   });
   return observer;
 }
 
-function finalizeRecord(observer, endState, error = null) {
-  if (observer.recordFinalized) return;
-  observer.recordFinalized = true;
-  const recordId = activeRecords.get(observer.sessionId);
-  if (!recordId) return;
-  try {
-    finishTurn(recordId, { endState, error });
-  } catch (err) {
-    writeLog('finish_turn_failed', {
-      sessionId: observer.sessionId,
-      recordId,
-      message: err instanceof Error ? err.message : String(err),
-    });
-  }
-  activeRecords.delete(observer.sessionId);
-  observer.recordId = null;
-}
-
 function observeInput(observer, input) {
-  // P1b：不再用 oscDetected 分支。用户输入字符即 prompt 文本（pi raw 模式不回显，
-  // 但 observeInput 看到的是 client→PTY 的原始按键），直接捕获为 user 文本。
-  // 过滤控制/转义序列，处理退格。role 标注的难点在 assistant 回复侧（P1d），与 user 输入无关。
   for (const char of input) {
     if (char === '\r' || char === '\n') {
-      flushUserMessage(observer);
+      const text = observer.userBuffer.trim();
+      observer.userBuffer = '';
+      if (text) {
+        observer.hasUserMessage = true;
+        writeLog('user_message', { sessionId: observer.sessionId, text, bytes: Buffer.byteLength(text, 'utf-8') });
+        observer.terminal?.setHasUserTurn(true);
+      }
       continue;
     }
     if (char === '\b' || char === '\x7f') {
@@ -170,77 +160,40 @@ function observeInput(observer, input) {
   }
 }
 
-function flushUserMessage(observer) {
-  const text = observer.userBuffer.trim();
-  observer.userBuffer = '';
-  if (!text) return;
-
-  // 收敛前一个未结束的 record
-  if (observer.recordFinalized === false && activeRecords.has(observer.sessionId)) {
-    finalizeRecord(observer, 'session_exit', 'superseded');
-  }
-
-  observer.hasUserMessage = true;
-
-  const recordId = beginTurn({
-    sessionId: observer.sessionId,
-    cwd: observer.cwd,
-    command: observer.command,
-    userText: text,
-  });
-  activeRecords.set(observer.sessionId, recordId);
-  observer.recordId = recordId;
-  observer.recordFinalized = false;
-
-  // P1b：开新 turn，复位 OSC 计数（aCount/zoneStart），告知 terminal-observer 等待回复 finalize。
-  observer.terminal.setHasUserTurn(true);
-
-  writeLog('user_message', { type: 'user_message', sessionId: observer.sessionId, text, recordId, bytes: Buffer.byteLength(text, 'utf-8') });
-}
-
 function observeOutput(observer, output) {
-  // PTY 输出旁路喂 headless grid（差分渲染可见文本还原 + OSC 133 turn 状态机）。
-  // 不论 hasUserMessage 都喂，保证 grid 始终与真实终端同步（resize/重绘/alt-screen 都要进 grid）。
-  observer.terminal.feed(output);
-
-  if (!observer.hasUserMessage) return;
-
-  // appendOutput 保留原始字节供搜索/重放；可见文本还原走 grid snapshot，不依赖此内容。
-  const recordId = activeRecords.get(observer.sessionId);
-  if (recordId) {
-    try { appendOutput(recordId, output); }
-    catch (err) {
-      writeLog('append_output_failed', { sessionId: observer.sessionId, message: err instanceof Error ? err.message : String(err) });
-    }
-  }
-}
-
-// P1b/P1e：terminal-observer 在回复 finalize（OSC 去抖或 idle 兜底）时回调此函数。
-// payload = { assistantText, userTextFromOsc, role }。
-//   - assistantText：grid snapshot 还原的回复可见文本（录 agent_reply）
-//   - userTextFromOsc：OSC A..B 捕获的 user 文本（P1e，pi 渲染的真实 user 文本，校准信号）
-//   - role：'assistant'(OSC) | 'mixed'(idle 合录)
-// 用 userTextFromOsc 与 observeInput 的 userText 比对，记校准日志；observeInput 为空时 fallback 录。
-function onReplyFinalize(observer, payload, reason) {
-  const { assistantText, userTextFromOsc, role } = payload || {};
-  if (assistantText) {
-    writeLog('agent_reply', { type: 'agent_reply', sessionId: observer.sessionId, text: assistantText, bytes: Buffer.byteLength(assistantText, 'utf-8'), reason, role });
-  } else {
-    writeLog('agent_reply_empty', { sessionId: observer.sessionId, reason, role });
-  }
-  // P1e：user 文本双源校准。observeInput 按键直捕 vs OSC A..B 渲染文本。
-  // 不改 record 结构（userText 已在 beginTurn 录），仅记校准日志供 P1f 决定是否切主源。
-  if (userTextFromOsc) {
-    writeLog('user_text_osc', { sessionId: observer.sessionId, text: userTextFromOsc, bytes: Buffer.byteLength(userTextFromOsc, 'utf-8'), role });
-  }
-  const endState = (reason === 'pty_exit' || reason === 'ws_closed') ? 'session_exit' : 'idle';
-  finalizeRecord(observer, endState, null);
-  observer.hasUserMessage = false;
-  observer.terminal?.setHasUserTurn(false);
+  observer.terminal?.feed(output);
 }
 
 app.prepare().then(() => {
-  writeLog('server_ready', { dev, hostname, port, cwd: process.cwd(), verboseLog: VERBOSE_LOG });
+  // 初始化 SQLite 数据库；支持 DATA_DIR 环境变量覆盖（测试用）
+  const dbPath = process.env.DATA_DIR
+    ? join(process.env.DATA_DIR, 'nterminal.db')
+    : join(process.cwd(), 'data', 'nterminal.db');
+  initializeDatabase(dbPath);
+
+  // 首次启动自动发现默认对话源
+  discoverDefaultSources(getDb());
+
+  // 创建导入引擎：定时同步（1h）+ fs.watch 文件变更触发
+  // 设计 C-001/C-013：startup → initializeDatabase → syncAll → startScheduler → startWatcher
+  importEngine = createImportEngine({ db: getDb() });
+  importEngine
+    .syncAll()
+    .then((results) => {
+      writeLog('import_sync_initial', {
+        sources: results.length,
+        imported: results.reduce((acc, r) => acc + r.result.importedCount, 0),
+        failed: results.reduce((acc, r) => acc + r.result.failedCount, 0),
+      });
+    })
+    .catch((err) => writeLog('import_sync_initial_failed', { message: err instanceof Error ? err.message : String(err) }));
+  importEngine.startScheduler();
+  importEngine.startWatcher();
+
+  // 启动 PTY 清理定时器（30s 扫一次，60s 无连接 kill）
+  startSweeper();
+
+  writeLog('server_ready', { dev, hostname, port, cwd: process.cwd(), verboseLog: VERBOSE_LOG, dbPath });
 
   const server = createServer(async (req, res) => {
     try {
@@ -248,43 +201,75 @@ app.prepare().then(() => {
       verboseLog('http_request', { method: req.method, pathname: parsedUrl.pathname });
 
       if (parsedUrl.pathname.startsWith('/api/')) {
-        if (req.method !== 'POST' && (parsedUrl.pathname.startsWith('/api/records/') || parsedUrl.pathname.startsWith('/api/path-history/'))) {
+        // conversation-sources 允许 GET/POST/DELETE
+        if (parsedUrl.pathname.startsWith('/api/conversation-sources')) {
+          await handleConversationSources(req, res, parsedUrl);
+          return;
+        }
+        // session/list 允许 GET 和 POST
+        if (parsedUrl.pathname === '/api/session/list') {
+          await handleSessionsList(req, res);
+          return;
+        }
+        // session/:id/kill 必须 POST，提前拦截避免掉到 405 分支
+        if (/^\/api\/session\/[^/]+\/kill$/.test(parsedUrl.pathname)) {
+          if (req.method !== 'POST') {
+            errorResponse(res, 405, 'method_not_allowed', '只允许 POST 方法');
+            return;
+          }
+          await handleSessionKill(req, res, parsedUrl);
+          return;
+        }
+        // workspace/tabs 参数化路由（在 switch 之前拦截）
+        if (/^\/api\/workspaces\/[^/]+\/tabs\/list$/.test(parsedUrl.pathname)) {
+          if (req.method !== 'POST') { errorResponse(res, 405, 'method_not_allowed', '只允许 POST'); return; }
+          await handleTabsList(req, res, parsedUrl);
+          return;
+        }
+        if (/^\/api\/workspaces\/[^/]+\/tabs\/create$/.test(parsedUrl.pathname)) {
+          if (req.method !== 'POST') { errorResponse(res, 405, 'method_not_allowed', '只允许 POST'); return; }
+          await handleTabsCreate(req, res, parsedUrl);
+          return;
+        }
+        if (/^\/api\/tabs\/[^/]+\/kill$/.test(parsedUrl.pathname)) {
+          if (req.method !== 'POST') { errorResponse(res, 405, 'method_not_allowed', '只允许 POST'); return; }
+          await handleTabKill(req, res, parsedUrl);
+          return;
+        }
+        if (/^\/api\/workspaces\/[^/]+\/tabs\/[^/]+\/preview$/.test(parsedUrl.pathname)) {
+          await handleTabPreview(req, res, parsedUrl);
+          return;
+        }
+        // 其余 API 只允许 POST
+        if (req.method !== 'POST') {
           errorResponse(res, 405, 'method_not_allowed', '只允许 POST 方法');
           return;
         }
-        if (req.method === 'POST') {
-          switch (parsedUrl.pathname) {
+        switch (parsedUrl.pathname) {
             case '/api/session/create':
               await handleCreateSession(req, res);
               return;
             case '/api/directory/validate':
               await handleDirectoryValidate(req, res);
               return;
-            case '/api/path-history/list':
-              await handlePathHistoryList(req, res);
+            case '/api/completion/query':
+              await handleCompletionQuery(req, res);
               return;
-            case '/api/path-history/save':
-              await handlePathHistorySave(req, res);
+            case '/api/workspaces/list':
+              await handleWorkspacesList(req, res);
               return;
-            case '/api/path-history/delete':
-              await handlePathHistoryDelete(req, res);
+            case '/api/workspaces/create':
+              await handleWorkspacesCreate(req, res);
               return;
-            case '/api/path-history/clear':
-              await handlePathHistoryClear(req, res);
+            case '/api/workspaces/rename':
+              await handleWorkspacesRename(req, res);
               return;
-            case '/api/records/list':
-              await handleRecordsList(req, res);
-              return;
-            case '/api/records/search':
-              await handleRecordsSearch(req, res);
-              return;
-            case '/api/records/detail':
-              await handleRecordsDetail(req, res);
+            case '/api/workspaces/delete':
+              await handleWorkspacesDelete(req, res);
               return;
             default:
               break;
           }
-        }
       }
       await handle(req, res, parsedUrl);
     } catch (err) {
@@ -348,17 +333,26 @@ async function handleCreateSession(req, res) {
   if (cwd !== undefined && cwd !== null) {
     if (handleValidationError(res, validateCwd(cwd))) return;
   }
-  const result = createSession({ cwd: cwd || process.cwd() });
+  // tagLabel 可选字符串，长度上限 200 避免脏数据
+  const tagLabel = typeof body?.tagLabel === 'string' && body.tagLabel.trim() ? body.tagLabel.trim().slice(0, 200) : null;
+  // 标签数量限制：最多 8 个活跃会话（统计要在 create 之前，避免超额时仍然分配了 PTY）
+  if (getActiveSessions().length >= 8) {
+    errorResponse(res, 400, 'session_limit_reached', '最多 8 个活跃标签');
+    return;
+  }
+  const result = createSession({ cwd: cwd || process.cwd(), tagLabel });
   writeLog('session_created', {
     id: result.id, status: result.status, command: result.command, cwd: result.cwd,
-    error: result.error || null,
+    error: result.error || null, tagLabel: result.tagLabel || null,
   });
   if (result.status === 'error') {
     // 失败响应壳统一为 {ok:false, error:{code,message}}，不再附带 data.session
     errorResponse(res, 500, 'spawn_failed', result.error || '创建 PTY 会话失败');
     return;
   }
-  sendJson(res, 200, { ok: true, data: result });
+  // 创建成功后再取一次 activeSessions，确保响应里包含新建的那一个
+  const activeSessions = getActiveSessions();
+  sendJson(res, 200, { ok: true, data: { session: result, activeSessions } });
 }
 
 async function handleDirectoryValidate(req, res) {
@@ -388,111 +382,301 @@ async function handleDirectoryValidate(req, res) {
   });
 }
 
-async function handlePathHistoryList(req, res) {
-  const body = await readJsonBody(req);
-  const limit = Math.min(Math.max(parseInt(body?.limit ?? 50, 10) || 50, 1), 50);
-  try {
-    const r = await listPathHistory({ limit });
-    sendJson(res, 200, { ok: true, data: r });
-  } catch (err) {
-    errorResponse(res, 500, 'list_failed', err instanceof Error ? err.message : String(err));
-  }
-}
+// ===================== 对话源管理 API =====================
+// 统一处理 /api/conversation-sources 和 /api/conversation-sources/:id/sync
 
-async function handlePathHistorySave(req, res) {
-  const body = await readJsonBody(req);
-  if (handleValidationError(res, validatePath(body?.path))) return;
-  try {
-    const r = await validateAndSave({ path: body.path });
-    sendJson(res, 200, { ok: true, data: r });
-  } catch (err) {
-    // save 失败可能是目录已被删等 → 区分 directory_not_found / path_not_directory
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes('路径验证失败') || msg.includes('目录')) {
-      errorResponse(res, 400, 'directory_not_found', msg);
-    } else {
-      errorResponse(res, 400, 'save_failed', msg);
-    }
-  }
-}
+async function handleConversationSources(req, res, parsedUrl) {
+  const pathname = parsedUrl.pathname;
 
-async function handlePathHistoryDelete(req, res) {
-  const body = await readJsonBody(req);
-  if (handleValidationError(res, validatePath(body?.path))) return;
-  try {
-    const r = await deletePath({ path: body.path });
-    sendJson(res, 200, { ok: true, data: r });
-  } catch (err) {
-    errorResponse(res, 400, 'delete_failed', err instanceof Error ? err.message : String(err));
-  }
-}
-
-async function handlePathHistoryClear(req, res) {
-  try {
-    const r = await clearPathHistory();
-    sendJson(res, 200, { ok: true, data: r });
-  } catch (err) {
-    errorResponse(res, 500, 'clear_failed', err instanceof Error ? err.message : String(err));
-  }
-}
-
-async function handleRecordsList(req, res) {
-  const body = await readJsonBody(req);
-  if (handleValidationError(res, validateQuery(body?.query))) return;
-  if (body?.cwd !== undefined && body.cwd !== null) {
-    if (handleValidationError(res, validatePath(body.cwd, 'cwd'))) return;
-  }
-  try {
-    const { listRecords } = await import('./server/interaction-recorder.mjs');
-    const r = listRecords({
-      query: body?.query || '',
-      cwd: body?.cwd || null,
-      sessionId: body?.sessionId || null,
-      limit: Math.min(Math.max(parseInt(body?.limit ?? 20, 10) || 20, 1), 50),
-      offset: Math.max(parseInt(body?.offset ?? 0, 10) || 0, 0),
-    });
-    sendJson(res, 200, { ok: true, data: r });
-  } catch (err) {
-    errorResponse(res, 500, 'list_failed', err instanceof Error ? err.message : String(err));
-  }
-}
-
-async function handleRecordsSearch(req, res) {
-  const body = await readJsonBody(req);
-  // 设计 C-001：search 必须有 query；空 query 返 400 + query_empty
-  if (handleValidationError(res, validateQuery(body?.query, { required: true }))) return;
-  if (body && body.scope && body.scope !== 'global') {
-    errorResponse(res, 400, 'scope_invalid', 'scope 必须为 "global"');
-    return;
-  }
-  try {
-    const { searchRecords } = await import('./server/interaction-recorder.mjs');
-    const r = searchRecords({
-      query: body.query,
-      limit: Math.min(Math.max(parseInt(body?.limit ?? 20, 10) || 20, 1), 50),
-    });
-    sendJson(res, 200, { ok: true, data: r });
-  } catch (err) {
-    errorResponse(res, 500, 'search_failed', err instanceof Error ? err.message : String(err));
-  }
-}
-
-async function handleRecordsDetail(req, res) {
-  const body = await readJsonBody(req);
-  if (typeof body?.recordId !== 'string' || !body.recordId) {
-    errorResponse(res, 400, 'invalid_recordId', 'recordId 必须是非空字符串');
-    return;
-  }
-  try {
-    const { getRecordById } = await import('./server/interaction-recorder.mjs');
-    const r = getRecordById(body.recordId);
-    if (!r) {
-      errorResponse(res, 404, 'not_found', `记录 ${body.recordId} 不存在`);
+  // POST /api/conversation-sources → 添加对话源
+  if (req.method === 'POST' && pathname === '/api/conversation-sources') {
+    const body = await readJsonBody(req);
+    if (!body?.path || typeof body.path !== 'string') {
+      errorResponse(res, 400, 'invalid_path', 'path 必须是非空字符串');
       return;
     }
-    sendJson(res, 200, { ok: true, data: { record: r } });
+    if (!body?.agentType || !['claude', 'pi', 'codex'].includes(body.agentType)) {
+      errorResponse(res, 400, 'invalid_agentType', 'agentType 必须是 claude / pi / codex');
+      return;
+    }
+    if (handleValidationError(res, validatePath(body.path))) return;
+    try {
+      const r = insertConversationSource({
+        path: body.path,
+        agentType: body.agentType,
+        label: body.label || null,
+      });
+      sendJson(res, 200, { ok: true, data: r });
+    } catch (err) {
+      errorResponse(res, 500, 'add_failed', err instanceof Error ? err.message : String(err));
+    }
+    return;
+  }
+
+  // GET /api/conversation-sources → 列表对话源
+  if (req.method === 'GET' && pathname === '/api/conversation-sources') {
+    try {
+      const items = listConversationSources();
+      sendJson(res, 200, { ok: true, data: { items } });
+    } catch (err) {
+      errorResponse(res, 500, 'list_failed', err instanceof Error ? err.message : String(err));
+    }
+    return;
+  }
+
+  // DELETE /api/conversation-sources/:id → 删除对话源
+  if (req.method === 'DELETE') {
+    const match = pathname.match(/^\/api\/conversation-sources\/([^/]+)$/);
+    if (match) {
+      const id = match[1];
+      try {
+        const deleted = dbDeleteConversationSource(id);
+        if (!deleted) {
+          errorResponse(res, 404, 'not_found', `对话源 ${id} 不存在`);
+          return;
+        }
+        sendJson(res, 200, { ok: true, data: { ok: true } });
+      } catch (err) {
+        errorResponse(res, 500, 'remove_failed', err instanceof Error ? err.message : String(err));
+      }
+      return;
+    }
+  }
+
+  // POST /api/conversation-sources/:id/sync → 同步对话源
+  if (req.method === 'POST') {
+    const match = pathname.match(/^\/api\/conversation-sources\/([^/]+)\/sync$/);
+    if (match) {
+      const id = match[1];
+      try {
+        if (!importEngine) {
+          errorResponse(res, 503, 'engine_not_ready', '导入引擎尚未初始化');
+          return;
+        }
+        // 设计 C-001：调用引擎执行真实解析，返回真实计数
+        const result = importEngine.syncSource
+          ? await importEngine.syncSource(id)
+          : await importEngine.syncAll().then((rs) => {
+              const found = rs.find((r) => r.sourceId === id);
+              return found ? found.result : { importedCount: 0, skippedCount: 0, failedCount: 1 };
+            });
+        sendJson(res, 200, { ok: true, data: result });
+      } catch (err) {
+        errorResponse(res, 500, 'sync_failed', err instanceof Error ? err.message : String(err));
+      }
+      return;
+    }
+  }
+
+  // 未匹配的路由
+  errorResponse(res, 404, 'not_found', `未找到路由 ${pathname}`);
+}
+
+// ===================== 补全查询 API =====================
+
+async function handleCompletionQuery(req, res) {
+  const body = await readJsonBody(req);
+  if (!body?.prefix || typeof body.prefix !== 'string') {
+    errorResponse(res, 400, 'invalid_prefix', 'prefix 必须是非空字符串');
+    return;
+  }
+  // 设计 C-006：prefix 长度 1-200 字符
+  if (body.prefix.length > 200) {
+    errorResponse(res, 400, 'prefix_too_long', 'prefix 长度不能超过 200 字符');
+    return;
+  }
+  const limit = Math.min(Math.max(parseInt(body.limit ?? 8, 10) || 8, 1), 20);
+  try {
+    const items = dbQueryCompletion(body.prefix, limit);
+    sendJson(res, 200, { ok: true, data: { items } });
   } catch (err) {
-    errorResponse(res, 500, 'detail_failed', err instanceof Error ? err.message : String(err));
+    errorResponse(res, 500, 'query_failed', err instanceof Error ? err.message : String(err));
+  }
+}
+
+// ===================== 会话列表 API =====================
+
+async function handleSessionsList(req, res) {
+  try {
+    const sessions = getActiveSessions();
+    sendJson(res, 200, { ok: true, data: { sessions } });
+  } catch (err) {
+    errorResponse(res, 500, 'list_failed', err instanceof Error ? err.message : String(err));
+  }
+}
+
+// 关闭会话：kill PTY + 从 Map 移除（幂等）
+async function handleSessionKill(req, res, parsedUrl) {
+  try {
+    // 路径形如 /api/session/:id/kill，提取 id
+    const m = parsedUrl.pathname.match(/^\/api\/session\/([^/]+)\/kill$/);
+    const sessionId = m ? m[1] : '';
+    if (!sessionId || sessionId === 'undefined') {
+      errorResponse(res, 400, 'invalid_sessionId', 'sessionId 不能为空');
+      return;
+    }
+    // 关闭前先踢掉挂在该 session 上的 WS（避免 zombie observer）
+    const observer = sessionObservers.get(sessionId);
+    if (observer) {
+      try { observer.ws.close(1000, 'session_killed'); } catch { /* ignore */ }
+      sessionObservers.delete(sessionId);
+    }
+    const ok = killSession(sessionId);
+    if (!ok) {
+      // 不存在也算成功（幂等），但记录日志
+      writeLog('session_kill_noop', { sessionId });
+    } else {
+      writeLog('session_killed', { sessionId });
+    }
+    sendJson(res, 200, { ok: true, data: { killed: ok } });
+  } catch (err) {
+    errorResponse(res, 500, 'kill_failed', err instanceof Error ? err.message : String(err));
+  }
+}
+
+// ===================== Workspaces / Tabs API =====================
+
+async function handleWorkspacesList(req, res) {
+  try {
+    const db = getDb();
+    const workspaces = db.prepare('SELECT * FROM workspaces ORDER BY last_active_at DESC').all();
+    sendJson(res, 200, { ok: true, data: workspaces });
+  } catch (err) {
+    errorResponse(res, 500, 'list_workspaces_failed', err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function handleWorkspacesCreate(req, res) {
+  try {
+    const body = await readBoundedRequestBody(req);
+    const { cwd, displayName } = body;
+    if (!cwd) {
+      errorResponse(res, 400, 'missing_cwd', '缺少 cwd 参数');
+      return;
+    }
+    const exists = checkDirectoryExists(cwd);
+    if (!exists.ok) {
+      errorResponse(res, 400, 'invalid_cwd', exists.message);
+      return;
+    }
+    const db = getDb();
+    const existing = db.prepare('SELECT id FROM workspaces WHERE id = ?').get(cwd);
+    if (existing) {
+      sendJson(res, 200, { ok: true, data: { id: cwd, created: false } });
+      return;
+    }
+    db.prepare('INSERT INTO workspaces (id, display_name) VALUES (?, ?)').run(cwd, displayName || null);
+    sendJson(res, 200, { ok: true, data: { id: cwd, created: true } });
+  } catch (err) {
+    errorResponse(res, 500, 'create_workspace_failed', err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function handleWorkspacesRename(req, res) {
+  try {
+    const body = await readBoundedRequestBody(req);
+    const { id, displayName } = body;
+    if (!id || displayName === undefined) {
+      errorResponse(res, 400, 'missing_params', '缺少 id 或 displayName 参数');
+      return;
+    }
+    const db = getDb();
+    db.prepare('UPDATE workspaces SET display_name = ? WHERE id = ?').run(displayName, id);
+    sendJson(res, 200, { ok: true });
+  } catch (err) {
+    errorResponse(res, 500, 'rename_workspace_failed', err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function handleWorkspacesDelete(req, res) {
+  try {
+    const body = await readBoundedRequestBody(req);
+    const { id } = body;
+    if (!id) {
+      errorResponse(res, 400, 'missing_id', '缺少 id 参数');
+      return;
+    }
+    const db = getDb();
+    const runningTabs = db.prepare(
+      "SELECT COUNT(*) as cnt FROM tab_sessions WHERE workspace_id = ? AND pty_status = 'running'"
+    ).get(id);
+    if (runningTabs.cnt > 0) {
+      errorResponse(res, 409, 'has_running_tabs', '工作区仍有运行中的标签页');
+      return;
+    }
+    db.prepare('DELETE FROM workspaces WHERE id = ?').run(id);
+    sendJson(res, 200, { ok: true });
+  } catch (err) {
+    errorResponse(res, 500, 'delete_workspace_failed', err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function handleTabsList(req, res, parsedUrl) {
+  try {
+    const cwd = decodeURIComponent(parsedUrl.pathname.split('/')[3]);
+    const db = getDb();
+    const tabs = db.prepare('SELECT * FROM tab_sessions WHERE workspace_id = ? ORDER BY created_at DESC').all(cwd);
+    sendJson(res, 200, { ok: true, data: tabs });
+  } catch (err) {
+    errorResponse(res, 500, 'list_tabs_failed', err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function handleTabsCreate(req, res, parsedUrl) {
+  try {
+    const cwd = decodeURIComponent(parsedUrl.pathname.split('/')[3]);
+    const body = await readBoundedRequestBody(req).catch(() => ({}));
+    const result = createSession({ cwd, ...body });
+    if (!result.ok) {
+      errorResponse(res, 400, 'pty_create_failed', result.error || '创建终端失败');
+      return;
+    }
+    const db = getDb();
+    const tabId = result.id;
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO tab_sessions (id, workspace_id, pty_status, created_at, last_ws_seen_at) VALUES (?, ?, 'running', ?, ?)"
+    ).run(tabId, cwd, now, now);
+    db.prepare(
+      "UPDATE workspaces SET session_count = session_count + 1, last_active_at = ? WHERE id = ?"
+    ).run(now, cwd);
+    sendJson(res, 200, { ok: true, data: { id: tabId, cwd } });
+  } catch (err) {
+    errorResponse(res, 500, 'create_tab_failed', err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function handleTabKill(req, res, parsedUrl) {
+  try {
+    const tabId = decodeURIComponent(parsedUrl.pathname.split('/')[3]);
+    const db = getDb();
+    const tab = db.prepare('SELECT * FROM tab_sessions WHERE id = ?').get(tabId);
+    if (!tab) {
+      errorResponse(res, 404, 'tab_not_found', '标签页不存在');
+      return;
+    }
+    killSession(tabId);
+    const now = new Date().toISOString();
+    db.prepare(
+      "UPDATE tab_sessions SET pty_status = 'ended', killed_at = ? WHERE id = ?"
+    ).run(now, tabId);
+    db.prepare(
+      "UPDATE workspaces SET session_count = MAX(0, session_count - 1) WHERE id = ?"
+    ).run(tab.workspace_id);
+    sendJson(res, 200, { ok: true, data: { killed: true } });
+  } catch (err) {
+    errorResponse(res, 500, 'kill_tab_failed', err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function handleTabPreview(req, res, parsedUrl) {
+  try {
+    const parts = parsedUrl.pathname.split('/');
+    const tabId = decodeURIComponent(parts[5]); // /api/workspaces/:cwd/tabs/:id/preview
+    const preview = getPreview(tabId);
+    sendJson(res, 200, { ok: true, data: { preview: preview || '' } });
+  } catch (err) {
+    errorResponse(res, 500, 'preview_failed', err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -516,11 +700,8 @@ function bindPtyWebSocket(ws, sessionId) {
       return;
     }
     if (event.type === 'exit') {
-      // P1b：兜底密封 = Warp TerminalModel::exit。先 flushNow 抓取未 finalize 的回复
-      // （OSC 去抖可能还 pending），再 finishTurn，再释放 grid。
       observer.terminal?.flushNow('pty_exit');
-      finalizeRecord(observer, 'session_exit', 'pty_exit');
-      observer.terminal.dispose();   // 释放 headless grid
+      observer.terminal.dispose();
       writeLog('session_exit', { sessionId, exitCode: event.exitCode, signal: event.signal });
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(`\r\n\x1b[90m[session exited (code ${event.exitCode})]\x1b[0m\r\n`);
@@ -538,6 +719,8 @@ function bindPtyWebSocket(ws, sessionId) {
         preview: makePreview(input.text, 'user'),
       });
 
+      touchSession(sessionId);
+
       if (!isBinary && maybeHandleControlMessage(ws, sessionId, input.text)) {
         return;
       }
@@ -551,15 +734,16 @@ function bindPtyWebSocket(ws, sessionId) {
 
   ws.on('close', () => {
     observer.terminal?.flushNow('ws_closed');
-    finalizeRecord(observer, 'session_exit', 'ws_closed');
-    observer.terminal.dispose();   // 释放 headless grid
+    observer.terminal.dispose();
+    // 主动 kill PTY 进程并从 sessions Map 删除，避免关页后子进程泄漏
+    try { disposePtySession(sessionId); }
+    catch (err) { writeLog('pty_dispose_failed', { sessionId, message: err instanceof Error ? err.message : String(err) }); }
     writeLog('ws_closed', { sessionId });
     removeSessionListener(sessionId, ptyListener);
     sessionObservers.delete(sessionId);
   });
 
   ws.on('error', (err) => {
-    finalizeRecord(observer, 'error', err instanceof Error ? err.message : String(err));
     writeLog('ws_error', { sessionId, message: err instanceof Error ? err.message : String(err) });
   });
 }

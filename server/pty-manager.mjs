@@ -11,6 +11,7 @@
 
 import pty from 'node-pty';
 import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { resolve as resolvePath } from 'node:path';
 import { validateCwd, checkDirectoryExists } from './validation.mjs';
 
@@ -27,12 +28,54 @@ function cleanEnv() {
   return env;
 }
 
+/**
+ * 探测一个可执行文件是否在 PATH 中可解析（跨平台 where/which）。
+ * 失败返回 null，绝不抛错。
+ */
+function whichOnPath(cmd) {
+  try {
+    const locator = process.platform === 'win32' ? 'where' : 'which';
+    const out = execFileSync(locator, [cmd], { stdio: ['ignore', 'pipe', 'ignore'] });
+    const s = out.toString().trim().split(/\r?\n/)[0];
+    return s || null;
+  } catch {
+    return null;
+  }
+}
+
+// 缓存 Windows shell 解析结果（进程内）
+let resolvedWindowsShell = null;
+
+/**
+ * 解析 Windows 默认 shell：优先 PowerShell 7(pwsh) → Windows PowerShell(powershell)
+ * → cmd.exe 兜底。允许 NTERM_SHELL 环境变量覆盖（值为文件名或绝对路径）。
+ */
+function resolveWindowsShell() {
+  if (process.env.NTERM_SHELL) {
+    return process.env.NTERM_SHELL;
+  }
+  if (resolvedWindowsShell) return resolvedWindowsShell;
+  const candidates = ['pwsh.exe', 'powershell.exe', 'cmd.exe'];
+  for (const c of candidates) {
+    const resolved = whichOnPath(c);
+    if (resolved) {
+      resolvedWindowsShell = resolved;
+      return resolved;
+    }
+  }
+  resolvedWindowsShell = process.env.COMSPEC || 'cmd.exe';
+  return resolvedWindowsShell;
+}
+
 function shellConfig() {
   if (process.platform === 'win32') {
-    return {
-      file: process.env.COMSPEC || 'cmd.exe',
-      args: ['/d'],
-    };
+    const file = resolveWindowsShell();
+    const base = (file.split(/[\\/]/).pop() || '').toLowerCase();
+    // PowerShell 用 -NoLogo；cmd 用 /d
+    if (base.startsWith('powershell') || base.startsWith('pwsh')) {
+      return { file, args: ['-NoLogo'] };
+    }
+    return { file, args: ['/d'] };
   }
   return {
     file: process.env.SHELL || '/bin/bash',
@@ -41,7 +84,12 @@ function shellConfig() {
 }
 
 function defaultShellCommand() {
-  return process.env.COMSPEC || (process.platform === 'win32' ? 'cmd.exe' : (process.env.SHELL || '/bin/bash'));
+  if (process.platform === 'win32') {
+    const file = resolveWindowsShell();
+    const base = (file.split(/[\\/]/).pop() || '').toLowerCase();
+    return base.startsWith('powershell') || base.startsWith('pwsh') ? base : 'cmd.exe';
+  }
+  return process.env.SHELL || '/bin/bash';
 }
 
 function createFailedSession(sessionId, cwd, command, error) {
@@ -150,7 +198,7 @@ export function resolveSpawnConfig(command, platform = process.platform) {
   };
 }
 
-export function createSession({ cwd, cols = 80, rows = 24 } = {}) {
+export function createSession({ cwd, cols = 80, rows = 24, tagLabel = null } = {}) {
   const sessionId = randomUUID();
   const command = defaultShellCommand();
 
@@ -177,6 +225,7 @@ export function createSession({ cwd, cols = 80, rows = 24 } = {}) {
       id: sessionId,
       cwd: resolvedCwd,
       command,
+      tagLabel: tagLabel || null,
       status: 'running',
       startedAt: new Date().toISOString(),
       endedAt: null,
@@ -185,6 +234,8 @@ export function createSession({ cwd, cols = 80, rows = 24 } = {}) {
       error: null,
       ptyProcess,
       outputBuffer: '',
+      ringBuffer: [],
+      lastSeenAt: Date.now(),
       listeners: new Set(),
     };
 
@@ -206,6 +257,17 @@ export function createSession({ cwd, cols = 80, rows = 24 } = {}) {
     ptyProcess.onData((data) => {
       session.outputBuffer += data;
 
+      // 写入 ring buffer（保留最近 100 行）
+      const lines = data.split('\n');
+      for (const line of lines) {
+        if (line) {
+          session.ringBuffer.push(line);
+          if (session.ringBuffer.length > 100) {
+            session.ringBuffer.shift();
+          }
+        }
+      }
+
       for (const listener of session.listeners) {
         try {
           listener({ type: 'data', data });
@@ -221,6 +283,7 @@ export function createSession({ cwd, cols = 80, rows = 24 } = {}) {
       id: sessionId,
       cwd: resolvedCwd,
       command,
+      tagLabel: session.tagLabel,
       status: 'running',
       startedAt: session.startedAt,
     };
@@ -240,6 +303,7 @@ export function getSession(sessionId) {
     id: session.id,
     cwd: session.cwd,
     command: session.command,
+    tagLabel: session.tagLabel || null,
     status: session.status,
     startedAt: session.startedAt,
     endedAt: session.endedAt,
@@ -304,6 +368,12 @@ export function dispose(sessionId) {
   }
 }
 
+/**
+ * killSession：dispose 的语义别名（更贴近用户视角）。
+ * 关闭 PTY 进程、从 Map 删除，幂等。
+ */
+export const killSession = dispose;
+
 export function addSessionListener(sessionId, listener) {
   const session = sessions.get(sessionId);
   if (!session) {
@@ -331,9 +401,58 @@ export function getActiveSessions() {
       id: session.id,
       cwd: session.cwd,
       command: session.command,
+      tagLabel: session.tagLabel || null,
       status: session.status,
       startedAt: session.startedAt,
     }));
+}
+
+let sweeperTimer = null;
+
+/**
+ * 启动 PTY 清理定时器：每 30s 扫一次，kill 60s 无 WS 连接的 PTY。
+ * @param {number} intervalMs - 扫描间隔（毫秒），默认 30000
+ * @param {number} ttlMs - 无连接超时（毫秒），默认 60000
+ */
+export function startSweeper(intervalMs = 30000, ttlMs = 60000) {
+  if (sweeperTimer) return;
+
+  sweeperTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [id, session] of sessions) {
+      if (session.status !== 'running') continue;
+      if (now - session.lastSeenAt > ttlMs) {
+        // 超时，kill PTY
+        try {
+          if (session.ptyProcess) session.ptyProcess.kill();
+          session.status = 'ended';
+          session.endedAt = new Date().toISOString();
+        } catch { /* ignore */ }
+      }
+    }
+  }, intervalMs);
+
+  if (sweeperTimer.unref) sweeperTimer.unref();
+}
+
+/**
+ * 更新 session 的 lastSeenAt。
+ * @param {string} sessionId
+ */
+export function touchSession(sessionId) {
+  const session = sessions.get(sessionId);
+  if (session) session.lastSeenAt = Date.now();
+}
+
+/**
+ * 获取 session 的 ring buffer 内容。
+ * @param {string} sessionId
+ * @returns {string|null} 最近 100 行输出，不存在返回 null
+ */
+export function getPreview(sessionId) {
+  const session = sessions.get(sessionId);
+  if (!session) return null;
+  return session.ringBuffer.join('\n');
 }
 
 export default {
@@ -343,10 +462,14 @@ export default {
   writeToSession,
   resize,
   dispose,
+  killSession,
   addSessionListener,
   removeSessionListener,
   getActiveSessions,
   spawnCommand,
   canResolveCommand,
   resolveSpawnConfig,
+  startSweeper,
+  touchSession,
+  getPreview,
 };

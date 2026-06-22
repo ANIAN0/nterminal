@@ -135,7 +135,14 @@ export function createTerminalObserver({
    * marker age-out（line<0）或越界 → 回退 baseY（viewport 顶）。
    */
   function snapshotReply() {
-    return readGridRange(zoneStartMarker?.line, null);
+    // 录"用户最终看到的 viewport"：grid 当前可见的整片 viewport
+    // （baseY..baseY+rows-1），而不是 zoneStart..cursor 整段 turn。
+    // 后者在 pi 这类流式 TUI 下会包含每个 streaming chunk 占的不同
+    // grid 行，残留大量中间态；viewport 快照拿到的是完成态回答 + prompt chrome。
+    // 语义对齐 Warp 终端"完成回答后用户看到的最后画面"。
+    const buf = term.buffer.active;
+    const end = buf.baseY + term.rows - 1;
+    return readGridRange(buf.baseY, end);
   }
 
   /**
