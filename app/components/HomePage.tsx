@@ -1,104 +1,56 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import Link from 'next/link';
-import { listWorkspaces, createWorkspace, deleteWorkspace, listConversationSources, createSession } from '../lib/api';
-import type { Workspace, ConversationSource } from '../lib/types';
-import WorkspaceSidebar from './WorkspaceSidebar';
+import { createTab } from '../lib/api';
+import { useWorkspace } from './WorkspaceProvider';
+import WorkspaceDialog from './WorkspaceDialog';
 
 export default function HomePage() {
   const router = useRouter();
-  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
-  const [sources, setSources] = useState<ConversationSource[]>([]);
-  const [totalConversations, setTotalConversations] = useState(0);
-  const [loading, setLoading] = useState(true);
-  const [newPath, setNewPath] = useState('');
+  const { workspaces, createWorkspace, pendingActions, error } = useWorkspace();
+  const [cwd, setCwd] = useState('');
+  const [opening, setOpening] = useState<string | null>(null);
+  const openingRef = useRef<string | null>(null);
 
-  const loadData = useCallback(async () => {
+  async function openWorkspace(workspaceId: string) {
+    if (openingRef.current) return;
+    openingRef.current = workspaceId;
+    setOpening(workspaceId);
     try {
-      const [ws, src] = await Promise.all([
-        listWorkspaces(),
-        listConversationSources(),
-      ]);
-      setWorkspaces(ws);
-      setSources(src.items || []);
-      setTotalConversations((src.items || []).reduce((sum, source) => sum + source.recordCount, 0));
-    } catch (err) {
-      console.error('Failed to load homepage data:', err);
+      const { tab } = await createTab(workspaceId, { requestId: crypto.randomUUID() });
+      router.push(`/terminal?workspace=${encodeURIComponent(workspaceId)}&tab=${encodeURIComponent(tab.id)}`);
     } finally {
-      setLoading(false);
+      openingRef.current = null;
+      setOpening(null);
     }
-  }, []);
-
-  useEffect(() => {
-    // 首屏加载延迟到微任务执行，避免 effect 内同步触发状态更新。
-    queueMicrotask(() => { void loadData(); });
-  }, [loadData]);
-
-  const handleCreate = useCallback(async () => {
-    if (!newPath.trim()) return;
-    try {
-      const cwd = newPath.trim();
-      await createWorkspace({ cwd });
-      const { session } = await createSession({ cwd });
-      setNewPath('');
-      await loadData();
-      router.push(`/terminal?sessionId=${encodeURIComponent(session.id)}`);
-    } catch (err) {
-      alert(err instanceof Error ? err.message : '创建工作区失败');
-    }
-  }, [newPath, loadData, router]);
-
-  const handleDelete = useCallback(async (id: string) => {
-    if (!confirm('确定删除工作区？')) return;
-    try {
-      await deleteWorkspace({ id });
-      await loadData();
-    } catch (err) {
-      alert(err instanceof Error ? err.message : '删除失败');
-    }
-  }, [loadData]);
-
-  const handleNavigate = useCallback(async (path: string) => {
-    try {
-      const { session } = await createSession({ cwd: path });
-      router.push(`/terminal?sessionId=${encodeURIComponent(session.id)}`);
-    } catch (err) {
-      alert(err instanceof Error ? err.message : '创建终端失败');
-    }
-  }, [router]);
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-screen text-[color:var(--color-fg-tertiary)]">
-        加载中...
-      </div>
-    );
   }
 
   return (
-    <div className="flex h-screen">
-      <WorkspaceSidebar
-        workspaces={workspaces}
-        onNavigate={handleNavigate}
-        onDelete={handleDelete}
-        newPath={newPath}
-        onNewPathChange={setNewPath}
-        onCreate={handleCreate}
+    <main className="p-8">
+      <h1 className="text-xl font-semibold">工作区概览</h1>
+      <WorkspaceDialog
+        cwd={cwd}
+        pending={pendingActions.has('create-workspace')}
+        onCwdChange={setCwd}
+        onSubmit={() => void createWorkspace(cwd.trim()).then(() => setCwd(''))}
       />
-      <div className="flex-1 flex flex-col">
-        {/* 顶部状态行 */}
-        <div className="h-10 border-b border-[color:var(--color-border-subtle)] flex items-center px-4 text-[11px] text-[color:var(--color-fg-tertiary)] gap-4">
-          <span>已发现 {sources.length} 个对话源</span>
-          <span>已导入 {totalConversations} 条对话</span>
-          <Link href="/settings" className="ml-auto hover:text-[color:var(--color-fg-primary)]">管理 →</Link>
-        </div>
-        {/* 主区域：空状态 */}
-        <div className="flex-1 flex items-center justify-center text-[color:var(--color-fg-quaternary)] text-sm">
-          选择或创建工作区以开始
-        </div>
-      </div>
-    </div>
+      {error && <p role="alert" className="mt-2 text-red-500">{error}</p>}
+      <section className="mt-8 grid gap-3">
+        {workspaces.map((workspace) => (
+          <button
+            key={workspace.id}
+            type="button"
+            onClick={() => void openWorkspace(workspace.id)}
+            disabled={opening === workspace.id}
+            className="rounded border p-4 text-left"
+          >
+            <strong>{workspace.displayName || workspace.id}</strong>
+            <span className="ml-3 text-xs opacity-60">{workspace.sessionCount || 0} 个活动标签</span>
+          </button>
+        ))}
+        {workspaces.length === 0 && <p className="opacity-60">添加工作区后开始使用终端。</p>}
+      </section>
+    </main>
   );
 }

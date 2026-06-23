@@ -49,10 +49,10 @@ export default function WorkspaceSidebar({
             data-testid={`workspace-${ws.id}`}
           >
             <span className="flex-1 text-[12px] text-[color:var(--color-fg-primary)] truncate">
-              {ws.display_name || ws.id.split(/[/\\]/).pop() || ws.id}
+              {ws.displayName || ws.id.split(/[/\\]/).pop() || ws.id}
             </span>
             <span className="text-[10px] text-[color:var(--color-fg-quaternary)]">
-              {ws.session_count}
+              {ws.sessionCount}
             </span>
             <button
               type="button"
