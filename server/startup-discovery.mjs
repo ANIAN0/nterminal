@@ -40,7 +40,7 @@ const DEFAULT_SOURCES = [
 
 /**
  * 发现并创建默认对话源。
- * @param {import('@tursodatabase/database/compat').Database} db - 数据库实例
+ * @param {import('better-sqlite3').Database} db - 数据库实例
  */
 export function discoverDefaultSources(db) {
   const checkStmt = db.prepare(
