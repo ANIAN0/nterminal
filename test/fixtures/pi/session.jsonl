@@ -1,0 +1,3 @@
+{"type":"session","version":3,"id":"pi-session","timestamp":"2026-01-01T00:00:00.000Z","cwd":"H:/fixture/pi"}
+{"type":"message","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"检查输入"}]}}
+{"type":"message","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"输入正常"}]}}

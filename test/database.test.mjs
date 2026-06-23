@@ -5,8 +5,7 @@ import { tmpdir } from 'node:os';
 import {
   closeDatabase,
   deleteConversationSource,
-  deleteConversation,
-  getConversationById,
+  getDb,
   initializeDatabase,
   insertConversation,
   insertConversationSource,
@@ -24,7 +23,7 @@ afterEach(() => {
 });
 
 describe('数据库', () => {
-  it('初始化后可写入、搜索和删除纯文本对话', () => {
+  it('初始化后可写入、搜索并在删除来源时保留纯文本对话', () => {
     tempDir = mkdtempSync(join(tmpdir(), 'nterminal-db-'));
     initializeDatabase(join(tempDir, 'test.db'));
     const source = insertConversationSource({ path: 'fixture', agentType: 'codex' });
@@ -37,12 +36,10 @@ describe('数据库', () => {
     })).toBe(true);
     expect(queryCompletion('你好')).toHaveLength(1);
     expect(searchConversations('SQLite')[0].conversation.id).toBe('message-1');
-    expect(getConversationById('message-1')?.content).toBe('你好，SQLite');
+    expect(getDb().prepare('SELECT content FROM conversations WHERE id = ?').get('message-1')?.content).toBe('你好，SQLite');
     expect(deleteConversationSource(source.id)).toBe(true);
     // 删除来源时依靠 ON DELETE SET NULL 保留已导入记录。
-    expect(getConversationById('message-1')?.source_id).toBeNull();
-    expect(deleteConversation('message-1')).toBe(true);
-    expect(getConversationById('message-1')).toBeNull();
+    expect(getDb().prepare('SELECT source_id FROM conversations WHERE id = ?').get('message-1')?.source_id).toBeNull();
   });
 });
 
