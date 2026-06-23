@@ -11,9 +11,14 @@
 
 import { readFileSync } from 'node:fs';
 import { parseSessionFile as parseClaudeSession } from './parsers/claude-parser.mjs';
+import { parseSessionFileWithMeta as parseClaudeSessionWithMeta } from './parsers/claude-parser.mjs';
 import { parseSessionFile as parsePiSession } from './parsers/pi-parser.mjs';
+import { parseSessionFileWithMeta as parsePiSessionWithMeta } from './parsers/pi-parser.mjs';
 import { parseSessionFile as parseCodexSession } from './parsers/codex-parser.mjs';
+import { parseSessionFileWithMeta as parseCodexSessionWithMeta } from './parsers/codex-parser.mjs';
 import { parseSessionFile as parseOpencodeSession } from './parsers/opencode-parser.mjs';
+import { parseSessionFilesWithMeta as parseOpencodeSessionsWithMeta } from './parsers/opencode-parser.mjs';
+import { createSessionContract } from './parsers/_shared/session-contract.mjs';
 
 // ===================== 解析器注册表 =====================
 
@@ -25,6 +30,13 @@ parserRegistry.set('claude', { parseSessionFile: parseClaudeSession });
 parserRegistry.set('pi', { parseSessionFile: parsePiSession });
 parserRegistry.set('codex', { parseSessionFile: parseCodexSession });
 parserRegistry.set('opencode', { parseSessionFile: parseOpencodeSession });
+
+const metadataParsers = new Map([
+  ['claude', (filePath) => [parseClaudeSessionWithMeta(filePath)]],
+  ['codex', (filePath) => [parseCodexSessionWithMeta(filePath)]],
+  ['pi', (filePath) => [parsePiSessionWithMeta(filePath)]],
+  ['opencode', (filePath) => parseOpencodeSessionsWithMeta(filePath)],
+]);
 
 // ===================== 格式检测 =====================
 
@@ -133,6 +145,28 @@ export function parseConversationFile(filePath, format) {
   }
 
   return parser.parseSessionFile(filePath);
+}
+
+/**
+ * 解析来源文件为统一会话数组；导入层只使用此入口，避免再次丢失 session/cwd。
+ */
+export function parseSourceFile(filePath, format) {
+  const actualFormat = format || detectFormat(filePath);
+  const parser = metadataParsers.get(actualFormat);
+  if (!parser) throw new Error(`未注册会话解析器: ${actualFormat || 'unknown'}`);
+  return parser(filePath).map((rawSession) => createSessionContract(
+    actualFormat,
+    filePath,
+    {
+      nativeSessionId: rawSession.sessionId,
+      cwd: rawSession.cwd,
+      title: rawSession.title,
+      timestamp: rawSession.timestamp,
+      startedAt: rawSession.startedAt,
+      endedAt: rawSession.endedAt,
+    },
+    rawSession.messages,
+  ));
 }
 
 // ===================== 扩展注册 =====================

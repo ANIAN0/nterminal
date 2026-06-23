@@ -14,7 +14,7 @@
  */
 
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 import { normalizeRole } from './_shared/role-mapper.mjs';
 
 /**
@@ -178,6 +178,24 @@ export function parseSessionFile(filePath) {
   }
 
   return results;
+}
+
+/**
+ * 解析 Claude JSONL 文件并保留会话归属元数据（sessionId/cwd/title/timestamp）。
+ * @param {string} filePath
+ * @returns {{sessionId: string, cwd: string|null, title: string|null,
+ *           timestamp: string|null, messages: Array<...>}}
+ */
+export function parseSessionFileWithMeta(filePath) {
+  const entries = readJsonl(filePath);
+  const first = entries.find((entry) => entry && typeof entry === 'object') || {};
+  return {
+    sessionId: first.sessionId || first.session_id || basename(filePath, '.jsonl'),
+    cwd: first.cwd || first.project?.path || null,
+    title: first.summary || first.display || null,
+    timestamp: msToIso(first.timestamp) || first.timestamp || null,
+    messages: parseSessionFile(filePath),
+  };
 }
 
 /**

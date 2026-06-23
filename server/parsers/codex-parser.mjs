@@ -178,9 +178,10 @@ export function parseSessionFileWithMeta(filePath) {
 
   for (const entry of entries) {
     if (entry.type === 'session_meta') {
-      sessionId = entry.id || null;
-      sessionCwd = entry.cwd || null;
-      sessionTimestamp = entry.timestamp || null;
+      const payload = entry.payload || entry;
+      sessionId = payload.id || entry.id || null;
+      sessionCwd = payload.cwd || entry.cwd || null;
+      sessionTimestamp = payload.timestamp || entry.timestamp || null;
       break;
     }
   }

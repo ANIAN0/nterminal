@@ -12,8 +12,18 @@
  *   5. tool part 作为独立的 tool 记录
  */
 
-import { Database } from '@tursodatabase/database/compat';
+import Database from 'better-sqlite3';
 import { normalizeRole } from './_shared/role-mapper.mjs';
+
+// readOpenCodeRevision：取 message.time_updated 最大值作为变更标记，决定 worker 是否跳过同步。
+export function readOpenCodeRevision(filePath) {
+  const db = new Database(filePath, { readonly: true });
+  try {
+    return db.prepare('SELECT MAX(time_updated) AS revision FROM message').get()?.revision ?? null;
+  } finally {
+    db.close();
+  }
+}
 
 /**
  * 解析 Opencode SQLite 数据库中的对话。
@@ -22,94 +32,88 @@ import { normalizeRole } from './_shared/role-mapper.mjs';
  * @returns {Array<{ role: string, content: string|null, toolCalls: string|null, toolCallId: string|null, timestamp: string|null }>} 解析结果
  */
 export function parseSessionFile(filePath) {
+  return parseSessionFilesWithMeta(filePath).flatMap((session) => session.messages);
+}
+
+/**
+ * 按 OpenCode 原生 session 分组解析，返回带 sessionId/cwd/title/startedAt/endedAt 的会话数组。
+ * 一次 JOIN 把 session/message/part 三表拉平后按内存 Map 重组，规避对运行库逐条 part 查询。
+ * @param {string} filePath
+ * @returns {Array<{sessionId: string, cwd: string|null, title: string|null,
+ *                  startedAt: string|null, endedAt: string|null,
+ *                  messages: Array<{nativeMessageId: string, role: string, content: string|null,
+ *                                   toolCalls: string|null, toolCallId: string|null, timestamp: string|null}>}>}
+ */
+export function parseSessionFilesWithMeta(filePath) {
   const db = new Database(filePath, { readonly: true });
 
   try {
-    // 查询所有 message 按时间排序
-    const messages = db
-      .prepare('SELECT id, session_id, time_created, data FROM message ORDER BY time_created')
-      .all();
+    const rows = db.prepare(`
+      SELECT
+        s.id AS session_id, s.directory, s.title,
+        s.time_created AS session_created, s.time_updated AS session_updated,
+        m.id AS message_id, m.time_created AS message_created, m.data AS message_data,
+        p.id AS part_id, p.time_created AS part_created, p.data AS part_data
+      FROM message m
+      JOIN session s ON s.id = m.session_id
+      LEFT JOIN part p ON p.message_id = m.id
+      ORDER BY s.time_created, m.time_created, p.time_created, p.id
+    `).all();
+    const sessions = new Map();
+    const messages = new Map();
 
-    const results = [];
-
-    for (const msg of messages) {
-      const msgData = JSON.parse(msg.data);
-      const rawRole = msgData.role;
-      const role = normalizeRole('opencode', rawRole);
-      const timestamp = msg.time_created ? new Date(msg.time_created).toISOString() : null;
-
-      // 查询该 message 关联的所有 part
-      const parts = db
-        .prepare("SELECT id, data FROM part WHERE message_id = ? ORDER BY time_created")
-        .all(msg.id);
-
-      if (role === 'user') {
-        // user message：从 type='text' 的 part 提取文本
-        const textParts = parts.filter((p) => {
-          const d = JSON.parse(p.data);
-          return d.type === 'text';
+    for (const row of rows) {
+      if (!sessions.has(row.session_id)) {
+        sessions.set(row.session_id, {
+          sessionId: row.session_id,
+          cwd: row.directory || null,
+          title: row.title || null,
+          startedAt: row.session_created ? new Date(row.session_created).toISOString() : null,
+          endedAt: row.session_updated ? new Date(row.session_updated).toISOString() : null,
+          messages: [],
         });
-
-        const text = textParts
-          .map((p) => JSON.parse(p.data).text)
-          .filter(Boolean)
-          .join('\n');
-
-        if (text) {
-          results.push({
-            role: 'user',
-            content: text,
-            toolCalls: null,
-            toolCallId: null,
-            timestamp,
-          });
-        }
-      } else if (role === 'assistant') {
-        // assistant message：从 type='text' 的 part 提取文本
-        const textParts = parts.filter((p) => {
-          const d = JSON.parse(p.data);
-          return d.type === 'text';
-        });
-
-        const text = textParts
-          .map((p) => JSON.parse(p.data).text)
-          .filter(Boolean)
-          .join('\n');
-
-        if (text) {
-          results.push({
-            role: 'assistant',
-            content: text,
-            toolCalls: null,
-            toolCallId: null,
-            timestamp,
-          });
-        }
-
-        // 从 type='tool' 的 part 提取工具调用，作为独立记录
-        const toolParts = parts.filter((p) => {
-          const d = JSON.parse(p.data);
-          return d.type === 'tool';
-        });
-
-        for (const tp of toolParts) {
-          const toolData = JSON.parse(tp.data);
-          results.push({
-            role: 'tool',
-            content: JSON.stringify({
-              tool: toolData.tool,
-              state: toolData.state,
-            }),
-            toolCalls: null,
-            toolCallId: toolData.callID || null,
-            timestamp,
-          });
-        }
       }
-      // system 和其他 role 跳过（opencode 中无 system role）
+      if (!messages.has(row.message_id)) {
+        messages.set(row.message_id, {
+          id: row.message_id,
+          sessionId: row.session_id,
+          timestamp: row.message_created ? new Date(row.message_created).toISOString() : null,
+          role: normalizeRole('opencode', JSON.parse(row.message_data).role),
+          parts: [],
+        });
+      }
+      if (row.part_id) messages.get(row.message_id).parts.push({ id: row.part_id, data: JSON.parse(row.part_data) });
     }
 
-    return results;
+    for (const message of messages.values()) {
+      const session = sessions.get(message.sessionId);
+      const text = message.parts
+        .filter((part) => part.data.type === 'text')
+        .map((part) => part.data.text)
+        .filter(Boolean)
+        .join('\n');
+      if (text) {
+        session.messages.push({
+          nativeMessageId: message.id,
+          role: message.role,
+          content: text,
+          toolCalls: null,
+          toolCallId: null,
+          timestamp: message.timestamp,
+        });
+      }
+      for (const part of message.parts.filter((item) => item.data.type === 'tool')) {
+        session.messages.push({
+          nativeMessageId: part.id,
+          role: 'tool',
+          content: JSON.stringify({ tool: part.data.tool, state: part.data.state }),
+          toolCalls: null,
+          toolCallId: part.data.callID || null,
+          timestamp: message.timestamp,
+        });
+      }
+    }
+    return [...sessions.values()];
   } finally {
     db.close();
   }
