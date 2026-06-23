@@ -8,116 +8,17 @@
  * - conversations_fts 虚拟表：FTS5 全文索引
  */
 
-import { mkdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { Database } from '@tursodatabase/database/compat';
+import Database from 'better-sqlite3';
+import {
+  DATABASE_SCHEMA_VERSION,
+  migrateDatabase,
+  readSchemaVersion,
+} from './database-migrations.mjs';
 
-/** @type {Database | null} */
+/** @type {import('better-sqlite3').Database | null} */
 let db = null;
-
-/**
- * 升级 conversation_sources 表的 agent_type CHECK 约束，添加 opencode。
- * @param {Database} database
- */
-function upgradeAgentTypeCheck(database) {
-  // 检查当前 conversation_sources 表的 CREATE 语句是否包含 opencode
-  const row = database.prepare(
-    "SELECT sql FROM sqlite_master WHERE type='table' AND name='conversation_sources'"
-  ).get();
-  if (!row || !row.sql) return;
-  if (/opencode/.test(row.sql)) return; // 已包含
-
-  // 临时禁用外键约束（重建表时需要）
-  database.pragma('foreign_keys = OFF');
-
-  // 使用重建表策略（REV-002-07 锁定）
-  database.exec(`
-    CREATE TABLE conversation_sources_new (
-      id TEXT PRIMARY KEY,
-      path TEXT NOT NULL,
-      agent_type TEXT NOT NULL CHECK(agent_type IN ('claude', 'pi', 'codex', 'opencode')),
-      label TEXT,
-      metadata TEXT,
-      last_synced_at TEXT,
-      record_count INTEGER DEFAULT 0,
-      status TEXT DEFAULT 'active' CHECK(status IN ('active', 'paused', 'error')),
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-  `);
-  database.exec(`INSERT INTO conversation_sources_new SELECT * FROM conversation_sources`);
-  database.exec(`DROP TABLE conversation_sources`);
-  database.exec(`ALTER TABLE conversation_sources_new RENAME TO conversation_sources`);
-
-  // 恢复外键约束
-  database.pragma('foreign_keys = ON');
-}
-
-/**
- * 添加 conversations.cwd 列（如果缺失）。
- * @param {Database} database
- */
-function addCwdColumnIfMissing(database) {
-  const columns = database.prepare("PRAGMA table_info(conversations)").all();
-  if (columns.some(col => col.name === 'cwd')) return; // 已存在
-  database.exec(`ALTER TABLE conversations ADD COLUMN cwd TEXT`);
-  database.exec(`CREATE INDEX IF NOT EXISTS idx_conversations_cwd ON conversations(cwd)`);
-}
-
-/**
- * 把旧版生成列迁移为普通列。Turso 默认不启用生成列，显式存储还能兼容纯文本 content。
- * @param {Database} database
- */
-function upgradeConversationSchema(database) {
-  const row = database.prepare(
-    "SELECT sql FROM sqlite_master WHERE type='table' AND name='conversations'"
-  ).get();
-  if (!row?.sql) return;
-  const hasGeneratedUserText = /user_text\s+TEXT\s+GENERATED/i.test(row.sql);
-  const hasRequiredSource = /source_id\s+TEXT\s+NOT\s+NULL/i.test(row.sql);
-  if (!hasGeneratedUserText && !hasRequiredSource) return;
-  const userTextExpression = hasGeneratedUserText
-    ? "CASE WHEN role = 'user' THEN content ELSE NULL END"
-    : 'user_text';
-
-  // 重建期间关闭外键，避免重命名旧表时改写引用关系。
-  database.pragma('foreign_keys = OFF');
-  try {
-    database.exec(`
-      DROP TRIGGER IF EXISTS conversations_ai;
-      DROP TRIGGER IF EXISTS conversations_ad;
-      DROP TRIGGER IF EXISTS conversations_au;
-      DROP TABLE IF EXISTS conversations_fts;
-      ALTER TABLE conversations RENAME TO conversations_legacy;
-      CREATE TABLE conversations (
-        id TEXT PRIMARY KEY,
-        source_id TEXT,
-        session_id TEXT,
-        role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system', 'tool')),
-        content TEXT,
-        tool_calls TEXT,
-        tool_call_id TEXT,
-        metadata TEXT,
-        user_text TEXT,
-        ended_at TEXT,
-        created_at TEXT DEFAULT (datetime('now')),
-        cwd TEXT,
-        FOREIGN KEY(source_id) REFERENCES conversation_sources(id) ON DELETE SET NULL
-      );
-      INSERT INTO conversations (
-        id, source_id, session_id, role, content, tool_calls, tool_call_id,
-        metadata, user_text, ended_at, created_at, cwd
-      )
-      SELECT
-        id, source_id, session_id, role, content, tool_calls, tool_call_id,
-        metadata, ${userTextExpression},
-        ended_at, created_at, cwd
-      FROM conversations_legacy;
-      DROP TABLE conversations_legacy;
-    `);
-  } finally {
-    database.pragma('foreign_keys = ON');
-  }
-}
 
 /**
  * 初始化 SQLite 数据库，创建表和索引。
@@ -125,114 +26,53 @@ function upgradeConversationSchema(database) {
  * @returns {Database} 数据库实例
  */
 export function initializeDatabase(dbPath) {
-  // 确保数据目录存在
   const dir = dirname(dbPath);
   mkdirSync(dir, { recursive: true });
-
-  // 如果 db 已存在且路径相同，直接返回（避免重复初始化）
   if (db && db.name === dbPath) return db;
-
-  // 如果 db 已存在但路径不同，关闭旧连接
   if (db) {
     db.close();
     db = null;
   }
+  const existed = existsSync(dbPath) && statSync(dbPath).size > 0;
+  let currentVersion = 0;
+  if (existed) {
+    const probe = new Database(dbPath);
+    currentVersion = readSchemaVersion(probe);
+    if (currentVersion < DATABASE_SCHEMA_VERSION) {
+      // checkpoint 后关闭连接再复制，保证备份不遗漏 WAL 中已提交的数据。
+      probe.pragma('wal_checkpoint(TRUNCATE)');
+    }
+    probe.close();
+  }
 
-  db = new Database(dbPath);
+  const backupPath = `${dbPath}.pre-1.3.bak`;
+  if (existed && currentVersion < DATABASE_SCHEMA_VERSION) {
+    if (existsSync(backupPath)) {
+      const backupStat = statSync(backupPath);
+      // 同名目录或空文件不能提供恢复能力，必须阻止迁移而不是误判为已有备份。
+      if (!backupStat.isFile() || backupStat.size === 0) {
+        throw new Error('迁移备份路径不是有效的非空文件');
+      }
+    } else {
+      copyFileSync(dbPath, backupPath);
+    }
+  }
 
-  // 启用 WAL 模式（支持并发读写）和 foreign_keys
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
+  try {
+    db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+    migrateDatabase(db);
+    db.pragma('foreign_keys = ON');
+    return db;
+  } catch (error) {
+    db?.close();
+    db = null;
+    throw error;
+  }
+}
 
-  // 创建对话源表
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS conversation_sources (
-      id TEXT PRIMARY KEY,
-      path TEXT NOT NULL,
-      agent_type TEXT NOT NULL CHECK(agent_type IN ('claude', 'pi', 'codex', 'opencode')),
-      label TEXT,
-      metadata TEXT,
-      last_synced_at TEXT,
-      record_count INTEGER DEFAULT 0,
-      status TEXT DEFAULT 'active' CHECK(status IN ('active', 'paused', 'error')),
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-  `);
-
-  // 创建对话记录表
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS conversations (
-      id TEXT PRIMARY KEY,
-      source_id TEXT,
-      session_id TEXT,
-      role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system', 'tool')),
-      content TEXT,
-      tool_calls TEXT,
-      tool_call_id TEXT,
-      metadata TEXT,
-      user_text TEXT,
-      ended_at TEXT,
-      created_at TEXT DEFAULT (datetime('now')),
-      FOREIGN KEY(source_id) REFERENCES conversation_sources(id) ON DELETE SET NULL
-    );
-  `);
-
-  // 旧版生成列无法被 Turso 默认配置解析，启动时迁移为普通列。
-  upgradeConversationSchema(db);
-
-  // Turso 当前构建不包含 FTS5；清理旧索引，搜索统一使用参数化 LIKE。
-  db.exec(`
-    DROP TRIGGER IF EXISTS conversations_ai;
-    DROP TRIGGER IF EXISTS conversations_ad;
-    DROP TRIGGER IF EXISTS conversations_au;
-    DROP TABLE IF EXISTS conversations_fts;
-  `);
-
-  // 创建索引
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_conversations_source_id ON conversations(source_id);
-    CREATE INDEX IF NOT EXISTS idx_conversations_session_id ON conversations(session_id);
-    CREATE INDEX IF NOT EXISTS idx_conversations_ended_at ON conversations(ended_at);
-    CREATE INDEX IF NOT EXISTS idx_conversations_role ON conversations(role);
-  `);
-
-  // 升级 agent_type CHECK 约束
-  upgradeAgentTypeCheck(db);
-
-  // 添加 conversations.cwd 列
-  addCwdColumnIfMissing(db);
-
-  // 创建 workspaces 表
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS workspaces (
-      id TEXT PRIMARY KEY,
-      display_name TEXT,
-      created_at TEXT DEFAULT (datetime('now')),
-      last_active_at TEXT,
-      session_count INTEGER DEFAULT 0
-    );
-  `);
-
-  // 创建 tab_sessions 表
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS tab_sessions (
-      id TEXT PRIMARY KEY,
-      workspace_id TEXT NOT NULL,
-      pty_status TEXT CHECK (pty_status IN ('running','ended','error')),
-      created_at TEXT,
-      killed_at TEXT,
-      last_ws_seen_at TEXT,
-      FOREIGN KEY(workspace_id) REFERENCES workspaces(id)
-    );
-  `);
-
-  // 创建 tab_sessions 索引
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_tab_sessions_workspace_id ON tab_sessions(workspace_id);
-    CREATE INDEX IF NOT EXISTS idx_tab_sessions_last_ws_seen_at ON tab_sessions(last_ws_seen_at);
-  `);
-
-  return db;
+export function getSchemaVersion() {
+  return readSchemaVersion(getDb());
 }
 
 /**
@@ -263,8 +103,8 @@ export function insertConversationSource({ path, agentType, label = null }) {
   const database = getDb();
   const id = generateUUID();
   const stmt = database.prepare(`
-    INSERT INTO conversation_sources (id, path, agent_type, label)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO conversation_sources (id, path, agent_type, label, needs_reconcile, sync_state)
+    VALUES (?, ?, ?, ?, 1, 'idle')
   `);
   stmt.run(id, path, agentType, label);
   return { id, path, agentType, label, createdAt: new Date().toISOString() };
@@ -277,7 +117,9 @@ export function insertConversationSource({ path, agentType, label = null }) {
 export function listConversationSources() {
   const database = getDb();
   const stmt = database.prepare(`
-    SELECT id, path, agent_type, label, metadata, last_synced_at, record_count, status
+    SELECT id, path, agent_type, label, metadata, last_synced_at, record_count, status,
+           enabled, sync_state, needs_reconcile, last_attempt_at, last_success_at,
+           last_error_code, last_error_message, last_error_at
     FROM conversation_sources
     ORDER BY created_at DESC
   `);
@@ -290,6 +132,14 @@ export function listConversationSources() {
     lastSyncedAt: row.last_synced_at,
     recordCount: row.record_count,
     status: row.status,
+    enabled: Boolean(row.enabled),
+    syncState: row.sync_state,
+    needsReconcile: Boolean(row.needs_reconcile),
+    lastAttemptAt: row.last_attempt_at,
+    lastSuccessAt: row.last_success_at,
+    lastErrorCode: row.last_error_code,
+    lastErrorMessage: row.last_error_message,
+    lastErrorAt: row.last_error_at,
   }));
 }
 
@@ -445,9 +295,39 @@ export function queryCompletion(prefix, limit = 8) {
  */
 export function searchConversations(query, scope = 'all', limit = 20) {
   const database = getDb();
+  const boundedLimit = Math.min(Math.max(Number.parseInt(limit, 10) || 20, 1), 50);
+  const normalized = String(query).trim();
 
-  // “*” 用于首页统计预览；普通查询转义 LIKE 通配符，避免输入改变匹配语义。
-  const escaped = query === '*' ? '' : query.replace(/[\\%_]/g, '\\$&');
+  if (normalized === '*') {
+    return database.prepare(`
+      SELECT c.* FROM conversations c
+      ORDER BY c.ended_at DESC, c.rowid DESC
+      LIMIT ?
+    `).all(boundedLimit).map((row) => ({ conversation: row, snippet: row.content, rank: 0 }));
+  }
+
+  // trigram 至少需要三个 Unicode 字符；更短输入走有界 LIKE，避免 MATCH 无结果。
+  if (Array.from(normalized).length >= 3) {
+    const quoted = `"${normalized.replace(/"/g, '""')}"`;
+    const matchExpression = scope === 'user' ? `user_text : ${quoted}` : quoted;
+    const rows = database.prepare(`
+      SELECT c.*, snippet(conversations_fts, 0, '', '', '…', 24) AS search_snippet,
+             bm25(conversations_fts) AS search_rank
+      FROM conversations_fts
+      JOIN conversations c ON c.rowid = conversations_fts.rowid
+      WHERE conversations_fts MATCH ?
+      ORDER BY search_rank, c.ended_at DESC, c.rowid DESC
+      LIMIT ?
+    `).all(matchExpression, boundedLimit);
+    return rows.map(({ search_snippet, search_rank, ...conversation }) => ({
+      conversation,
+      snippet: search_snippet || conversation.content,
+      rank: search_rank,
+    }));
+  }
+
+  // 转义 LIKE 通配符，保证用户输入只表达字面量，不改变 SQL 匹配范围。
+  const escaped = normalized.replace(/[\\%_]/g, '\\$&');
   const pattern = `%${escaped}%`;
   const condition = scope === 'user'
     ? "c.user_text LIKE ? ESCAPE '\\'"
@@ -459,7 +339,7 @@ export function searchConversations(query, scope = 'all', limit = 20) {
     ORDER BY c.ended_at DESC, c.rowid DESC
     LIMIT ?
   `);
-  const params = scope === 'user' ? [pattern, limit] : [pattern, pattern, limit];
+  const params = scope === 'user' ? [pattern, boundedLimit] : [pattern, pattern, boundedLimit];
   return stmt.all(...params).map((row) => ({
     conversation: row,
     snippet: row.content,
@@ -545,16 +425,6 @@ export function listConversations(cursor = null, limit = 50, agentType = null) {
     nextCursor,
     total: totalRow?.total || 0,
   };
-}
-
-/** 按 ID 查询单条对话。 */
-export function getConversationById(id) {
-  return getDb().prepare('SELECT * FROM conversations WHERE id = ?').get(id) || null;
-}
-
-/** 删除单条对话并返回是否命中。 */
-export function deleteConversation(id) {
-  return getDb().prepare('DELETE FROM conversations WHERE id = ?').run(id).changes > 0;
 }
 
 /**
