@@ -1,37 +1,40 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import {
-  listConversationSources,
   addConversationSource,
+  listConversationSources,
   removeConversationSource,
   syncConversationSource,
 } from '../lib/api';
 import type { ConversationSource } from '../lib/types';
 
-type Status = 'idle' | 'adding' | 'removing' | 'syncing' | 'error';
+type Status = 'idle' | 'adding' | 'removing' | 'error';
+
+type AgentType = 'claude' | 'pi' | 'codex' | 'opencode';
 
 /**
- * 设置页 — 对话源配置
- * 添加/移除/同步对话源
+ * 设置页负责维护本地对话源；每个来源独立 pending，避免单点失败影响其他来源操作。
  */
 export default function SettingsPage() {
   const [sources, setSources] = useState<ConversationSource[]>([]);
   const [status, setStatus] = useState<Status>('idle');
   const [error, setError] = useState<string | null>(null);
-
-  // 表单状态
+  const [notice, setNotice] = useState<string | null>(null);
+  const [confirmRemoveId, setConfirmRemoveId] = useState<string | null>(null);
+  const [pendingActions, setPendingActions] = useState<Set<string>>(new Set());
+  const [syncingAll, setSyncingAll] = useState(false);
   const [path, setPath] = useState('');
-  const [agentType, setAgentType] = useState<'claude' | 'pi' | 'codex' | 'opencode'>('claude');
+  const [agentType, setAgentType] = useState<AgentType>('claude');
   const [label, setLabel] = useState('');
 
   const loadSources = useCallback(async () => {
     try {
       const { items } = await listConversationSources();
       setSources(items);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '加载对话源失败');
+    } catch {
+      setError('加载对话源失败');
     }
   }, []);
 
@@ -39,8 +42,8 @@ export default function SettingsPage() {
     queueMicrotask(() => { void loadSources(); });
   }, [loadSources]);
 
-  const handleAdd = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleAdd = async (event: React.FormEvent) => {
+    event.preventDefault();
     setStatus('adding');
     setError(null);
     try {
@@ -49,42 +52,71 @@ export default function SettingsPage() {
       setLabel('');
       await loadSources();
       setStatus('idle');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '添加失败');
+    } catch {
+      setError('添加对话源失败');
       setStatus('error');
     }
   };
 
   const handleRemove = async (id: string) => {
-    if (!confirm('确定移除此对话源？已导入的数据不会被删除。')) return;
+    if (confirmRemoveId !== id) {
+      setConfirmRemoveId(id);
+      return;
+    }
     setStatus('removing');
     setError(null);
     try {
       await removeConversationSource(id);
       await loadSources();
+      setConfirmRemoveId(null);
       setStatus('idle');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '移除失败');
+    } catch {
+      setError('移除对话源失败');
       setStatus('error');
     }
   };
 
   const handleSync = async (id: string) => {
-    setStatus('syncing');
+    const actionKey = `sync:${id}`;
+    if (pendingActions.has(actionKey)) return;
+    setPendingActions((current) => new Set(current).add(actionKey));
     setError(null);
     try {
       const result = await syncConversationSource(id);
-      alert(`同步完成：导入 ${result.importedCount} 条，跳过 ${result.skippedCount} 条`);
+      setNotice(`同步完成：写入 ${result.inserted} 条${result.skipped ? '，来源无变化' : ''}`);
       await loadSources();
-      setStatus('idle');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '同步失败');
-      setStatus('error');
+    } catch {
+      setError('同步对话源失败');
+    } finally {
+      setPendingActions((current) => {
+        const next = new Set(current);
+        next.delete(actionKey);
+        return next;
+      });
     }
   };
 
-  const statusColor = (s: string) => {
-    switch (s) {
+  const handleSyncAll = async () => {
+    if (syncingAll || sources.length === 0) return;
+    setSyncingAll(true);
+    setError(null);
+    setPendingActions(new Set(sources.map((source) => `sync:${source.id}`)));
+    try {
+      const results = await Promise.allSettled(sources.map((source) => syncConversationSource(source.id)));
+      const okCount = results.filter((result) => result.status === 'fulfilled' && result.value.state === 'active').length;
+      const failedCount = results.length - okCount;
+      setNotice(`同步全部完成：成功 ${okCount} 个，失败 ${failedCount} 个`);
+      await loadSources();
+    } catch {
+      setError('同步全部失败');
+    } finally {
+      setSyncingAll(false);
+      setPendingActions(new Set());
+    }
+  };
+
+  const statusColor = (sourceStatus: string) => {
+    switch (sourceStatus) {
       case 'active':
         return 'text-[color:var(--color-status-running)]';
       case 'error':
@@ -102,16 +134,13 @@ export default function SettingsPage() {
             <Logo />
             <span className="font-semibold tracking-tight">nterminal</span>
           </Link>
-          <span className="text-[color:var(--color-fg-quaternary)] text-xs">·</span>
+          <span className="text-[color:var(--color-fg-quaternary)] text-xs">/</span>
           <h1 className="text-sm text-[color:var(--color-fg-secondary)]">设置</h1>
         </div>
-        <Link href="/" className="nav-link" data-testid="back-home">
-          ← 返回
-        </Link>
+        <Link href="/" className="nav-link" data-testid="back-home">← 返回</Link>
       </header>
 
       <main className="flex-1 w-full max-w-3xl mx-auto px-6 py-8 flex flex-col gap-8">
-        {/* 错误提示 */}
         {error && (
           <div
             role="alert"
@@ -119,43 +148,33 @@ export default function SettingsPage() {
             data-testid="error-banner"
           >
             <span>{error}</span>
-            <button
-              type="button"
-              onClick={() => setError(null)}
-              className="ml-auto underline text-xs"
-            >
-              关闭
-            </button>
+            <button type="button" onClick={() => setError(null)} className="ml-auto underline text-xs">关闭</button>
           </div>
         )}
+        {notice && <div role="status" className="rounded border px-3 py-2 text-sm">{notice}</div>}
 
-        {/* 添加对话源表单 */}
         <section className="glass-panel p-5">
           <h2 className="text-lg font-semibold tracking-tight mb-4">添加对话源</h2>
           <form onSubmit={handleAdd} className="flex flex-col gap-4">
-            <div className="flex flex-col gap-1.5">
-              <label className="text-[12px] text-[color:var(--color-fg-secondary)]">
-                对话源路径
-              </label>
+            <label className="flex flex-col gap-1.5 text-[12px] text-[color:var(--color-fg-secondary)]">
+              对话源路径
               <input
                 type="text"
                 value={path}
-                onChange={(e) => setPath(e.target.value)}
+                onChange={(event) => setPath(event.target.value)}
                 placeholder="例如：~/.claude 或 /path/to/sessions"
                 className="input-mono"
                 data-testid="source-path"
                 required
               />
-            </div>
+            </label>
 
             <div className="flex gap-4">
-              <div className="flex flex-col gap-1.5 flex-1">
-                <label className="text-[12px] text-[color:var(--color-fg-secondary)]">
-                  Agent 类型
-                </label>
+              <label className="flex flex-col gap-1.5 flex-1 text-[12px] text-[color:var(--color-fg-secondary)]">
+                Agent 类型
                 <select
                   value={agentType}
-                  onChange={(e) => setAgentType(e.target.value as 'claude' | 'pi' | 'codex' | 'opencode')}
+                  onChange={(event) => setAgentType(event.target.value as AgentType)}
                   className="input-mono"
                   data-testid="source-agent-type"
                 >
@@ -164,101 +183,94 @@ export default function SettingsPage() {
                   <option value="codex">Codex</option>
                   <option value="opencode">OpenCode</option>
                 </select>
-              </div>
+              </label>
 
-              <div className="flex flex-col gap-1.5 flex-1">
-                <label className="text-[12px] text-[color:var(--color-fg-secondary)]">
-                  标签（可选）
-                </label>
+              <label className="flex flex-col gap-1.5 flex-1 text-[12px] text-[color:var(--color-fg-secondary)]">
+                标签（可选）
                 <input
                   type="text"
                   value={label}
-                  onChange={(e) => setLabel(e.target.value)}
+                  onChange={(event) => setLabel(event.target.value)}
                   placeholder="My Claude"
                   className="input-mono"
                   data-testid="source-label"
                 />
-              </div>
+              </label>
             </div>
 
-            <button
-              type="submit"
-              disabled={status === 'adding' || !path}
-              className="btn-primary self-start"
-              data-testid="add-source"
-            >
+            <button type="submit" disabled={status === 'adding' || !path} className="btn-primary self-start" data-testid="add-source">
               {status === 'adding' ? '添加中…' : '添加对话源'}
             </button>
           </form>
         </section>
 
-        {/* 对话源列表 */}
         <section>
-          <h2 className="text-lg font-semibold tracking-tight mb-3">对话源列表</h2>
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <h2 className="text-lg font-semibold tracking-tight">对话源列表</h2>
+            {sources.length > 0 && (
+              <button type="button" className="btn-ghost text-xs" disabled={syncingAll} onClick={handleSyncAll}>
+                {syncingAll ? '同步全部中…' : '同步全部'}
+              </button>
+            )}
+          </div>
+
           {sources.length === 0 ? (
             <div className="glass-panel px-4 py-8 text-center" data-testid="empty-sources">
-              <div className="text-sm text-[color:var(--color-fg-secondary)]">
-                暂无对话源
-              </div>
-              <div className="text-xs text-[color:var(--color-fg-tertiary)] mt-1">
-                添加本地 agent 对话文件路径以导入历史
-              </div>
+              <div className="text-sm text-[color:var(--color-fg-secondary)]">暂无对话源</div>
+              <div className="text-xs text-[color:var(--color-fg-tertiary)] mt-1">添加本地 agent 对话文件路径以导入历史</div>
             </div>
           ) : (
             <div className="flex flex-col gap-2" data-testid="sources-list">
-              {sources.map((source) => (
-                <div
-                  key={source.id}
-                  className="glass-panel px-4 py-3 flex items-center gap-4"
-                  data-testid={`source-item-${source.id}`}
-                >
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className="chip text-[10px] mono">{source.agentType}</span>
-                      {source.label && (
-                        <span className="text-[12px] text-[color:var(--color-fg-primary)]">
-                          {source.label}
-                        </span>
+              {sources.map((source) => {
+                const syncPending = pendingActions.has(`sync:${source.id}`);
+                return (
+                  <div key={source.id} className="glass-panel px-4 py-3 flex items-center gap-4" data-testid={`source-item-${source.id}`}>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="chip text-[10px] mono">{source.agentType}</span>
+                        {source.label && <span className="text-[12px] text-[color:var(--color-fg-primary)]">{source.label}</span>}
+                        <span className={`text-[10px] ${statusColor(source.status)}`}>{source.status}</span>
+                      </div>
+                      <div className="text-[11px] text-[color:var(--color-fg-tertiary)] mono truncate" title={source.path}>{source.path}</div>
+                      <div className="text-[10px] text-[color:var(--color-fg-quaternary)] mt-1">
+                        {source.recordCount} 条记录
+                        {source.lastSuccessAt
+                          ? ` · 最后成功：${new Date(source.lastSuccessAt).toLocaleString()}`
+                          : source.lastSyncedAt
+                            ? ` · 最后同步：${new Date(source.lastSyncedAt).toLocaleString()}`
+                            : ''}
+                      </div>
+                      {source.status === 'error' && (
+                        <div className="mt-2 rounded border border-[color:var(--color-accent-danger)]/30 px-2 py-1 text-[11px] text-[color:var(--color-accent-danger)]">
+                          <span className="mono mr-2">{source.lastErrorCode || 'SOURCE_ERROR'}</span>
+                          <span>{source.lastErrorMessage || '来源同步失败，可重试'}</span>
+                        </div>
                       )}
-                      <span className={`text-[10px] ${statusColor(source.status)}`}>
-                        {source.status}
-                      </span>
                     </div>
-                    <div
-                      className="text-[11px] text-[color:var(--color-fg-tertiary)] mono truncate"
-                      title={source.path}
-                    >
-                      {source.path}
-                    </div>
-                    <div className="text-[10px] text-[color:var(--color-fg-quaternary)] mt-1">
-                      {source.recordCount} 条记录
-                      {source.lastSyncedAt &&
-                        ` · 最后同步：${new Date(source.lastSyncedAt).toLocaleString()}`}
-                    </div>
-                  </div>
 
-                  <div className="flex items-center gap-2 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => handleSync(source.id)}
-                      disabled={status === 'syncing'}
-                      className="btn-ghost text-xs"
-                      data-testid={`sync-source-${source.id}`}
-                    >
-                      {status === 'syncing' ? '同步中…' : '同步'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleRemove(source.id)}
-                      disabled={status === 'removing'}
-                      className="btn-ghost text-xs text-[color:var(--color-accent-danger)]"
-                      data-testid={`remove-source-${source.id}`}
-                    >
-                      移除
-                    </button>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => handleSync(source.id)}
+                        disabled={syncPending}
+                        className="btn-ghost text-xs"
+                        data-testid={`sync-source-${source.id}`}
+                      >
+                        {syncPending ? '同步中…' : source.status === 'error' ? '重试' : '同步'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleRemove(source.id)}
+                        disabled={status === 'removing'}
+                        className="btn-ghost text-xs text-[color:var(--color-accent-danger)]"
+                        data-testid={`remove-source-${source.id}`}
+                      >
+                        {confirmRemoveId === source.id ? '再次点击确认' : '移除'}
+                      </button>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </section>
@@ -271,23 +283,8 @@ function Logo() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
       <rect x="2" y="3" width="20" height="14" rx="2.5" stroke="var(--color-accent)" strokeWidth="1.5" />
-      <path
-        d="M6 9 L9.5 12 L6 15"
-        stroke="var(--color-accent-2)"
-        strokeWidth="1.6"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        fill="none"
-      />
-      <line
-        x1="11"
-        y1="15"
-        x2="15"
-        y2="15"
-        stroke="var(--color-accent-warn)"
-        strokeWidth="1.6"
-        strokeLinecap="round"
-      />
+      <path d="M6 9 L9.5 12 L6 15" stroke="var(--color-accent-2)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+      <line x1="11" y1="15" x2="15" y2="15" stroke="var(--color-accent-warn)" strokeWidth="1.6" strokeLinecap="round" />
     </svg>
   );
 }
