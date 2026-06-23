@@ -13,8 +13,7 @@ interface TabBarProps {
 }
 
 /**
- * 标签栏组件
- * 顶部水平标签栏，支持创建/切换/关闭，最多 8 个标签
+ * 标签栏只负责标签展示和交互分发，实际 PTY 生命周期由上层和服务端管理。
  */
 export default function TabBar({
   tabs,
@@ -25,7 +24,6 @@ export default function TabBar({
 }: TabBarProps) {
   const [hoveredTab, setHoveredTab] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-
   const canCreate = tabs.length < MAX_TABS;
 
   return (
@@ -50,9 +48,8 @@ export default function TabBar({
               onMouseEnter={() => setHoveredTab(tab.id)}
               onMouseLeave={() => setHoveredTab(null)}
               data-testid={`tab-${tab.id}`}
-              title={tab.label}
+              title={tab.label || undefined}
             >
-              {/* 状态指示器 */}
               <span
                 className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                   tab.status === 'ready'
@@ -60,8 +57,7 @@ export default function TabBar({
                     : 'bg-[color:var(--color-fg-quaternary)] animate-pulse'
                 }`}
               />
-              <span className="truncate max-w-[120px]">{tab.label}</span>
-              {/* 关闭按钮 */}
+              <span className="truncate max-w-[120px]">{tab.label || tab.id.slice(0, 8)}</span>
               <button
                 type="button"
                 className={`ml-0.5 w-4 h-4 rounded flex items-center justify-center text-[10px] transition-opacity ${
@@ -69,11 +65,11 @@ export default function TabBar({
                     ? 'opacity-100'
                     : 'opacity-0 group-hover:opacity-100'
                 } hover:bg-[rgba(255,255,255,0.1)] text-[color:var(--color-fg-tertiary)] hover:text-[color:var(--color-fg-primary)]`}
-                onClick={(e) => {
-                  e.stopPropagation();
+                onClick={(event) => {
+                  event.stopPropagation();
                   onTabClose(tab.id);
                 }}
-                aria-label={`关闭 ${tab.label}`}
+                aria-label={`关闭 ${tab.label || tab.id}`}
                 data-testid={`tab-close-${tab.id}`}
               >
                 ×
@@ -83,7 +79,6 @@ export default function TabBar({
         })}
       </div>
 
-      {/* 新建标签按钮 */}
       <button
         type="button"
         onClick={onTabCreate}

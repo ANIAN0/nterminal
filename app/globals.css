@@ -153,6 +153,83 @@ body {
   outline: none;
 }
 
+.terminal-workspace-body {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.terminal-workspace-body__terminal {
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.terminal-workspace-body__composer {
+  position: sticky;
+  bottom: 0;
+  flex: 0 0 auto;
+}
+
+.terminal-composer {
+  position: relative;
+  display: flex;
+  gap: 8px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 14px;
+  background: var(--color-bg-panel-strong);
+  box-shadow: var(--shadow-card);
+  padding: 10px;
+}
+
+.terminal-composer textarea {
+  min-height: 38px;
+  flex: 1;
+  resize: none;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--color-fg-primary);
+  font-family: var(--font-geist-mono), "Cascadia Mono", monospace;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.terminal-composer textarea:disabled {
+  color: var(--color-fg-tertiary);
+}
+
+.terminal-composer__completion {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: calc(100% + 8px);
+  display: flex;
+  max-height: 280px;
+  flex-direction: column;
+  overflow: auto;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 12px;
+  background: var(--color-bg-panel-strong);
+  box-shadow: var(--shadow-card);
+  padding: 6px;
+}
+
+.terminal-composer__completion button {
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--color-fg-primary);
+  cursor: pointer;
+  padding: 8px 10px;
+  text-align: left;
+}
+
+.terminal-composer__completion button:hover {
+  background: rgba(165, 213, 254, 0.08);
+}
+
 /* ------------------------------------------------------------------
  * 滚动条 —— 深色风格
  * ------------------------------------------------------------------ */
