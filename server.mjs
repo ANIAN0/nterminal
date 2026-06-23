@@ -5,26 +5,27 @@
  * - 路径入口、历史页、详情页所需的 HTTP/WS 路由在此收敛
  */
 
-import { appendFileSync, mkdirSync } from 'node:fs';
+
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { parse } from 'node:url';
 import next from 'next';
 import { WebSocket, WebSocketServer } from 'ws';
-import { makePreview } from './server/text-utils.mjs';
 import { createTerminalObserver } from './server/terminal-observer.mjs';
 
 import {
   addSessionListener,
   createSession,
-  dispose as disposePtySession,
   getSession,
+  getOutputSnapshot,
   killSession,
   removeSessionListener,
   resize,
   writeToSession,
+  getActiveSessions,
 } from './server/pty-manager.mjs';
 import { startSweeper, touchSession, getPreview } from './server/pty-manager.mjs';
+import { encodeEnvelope, encodeOutputFrame, parseControlEnvelope } from './server/terminal-protocol.mjs';
 
 import {
   validateCwd,
@@ -34,22 +35,23 @@ import {
   readBoundedRequestBody,
 } from './server/validation.mjs';
 
-import { initializeDatabase, getDb } from './server/database.mjs';
+import { initializeDatabase, getDb, getSchemaVersion } from './server/database.mjs';
 import {
   insertConversationSource,
   listConversationSources,
   deleteConversationSource as dbDeleteConversationSource,
   queryCompletion as dbQueryCompletion,
-  searchConversations,
-  getConversationById,
-  deleteConversation,
 } from './server/database.mjs';
 import { createImportEngine } from './server/conversation-import.mjs';
-import { getActiveSessions } from './server/pty-manager.mjs';
 import { discoverDefaultSources } from './server/startup-discovery.mjs';
+import { createWorkspaceService, WorkspaceServiceError } from './server/workspace-service.mjs';
+import { HistoryServiceError, getHistorySession, listHistorySessions } from './server/history-service.mjs';
+import { createLogger } from './server/logger.mjs';
+import { getHealthStatus } from './server/health-service.mjs';
 
 // 导入引擎实例（启动流程中初始化，sync API 复用）
 let importEngine = null;
+let workspaceService = null;
 /** @returns {ReturnType<typeof createImportEngine> | null} */
 export function getImportEngine() {
   return importEngine;
@@ -59,7 +61,6 @@ const dev = process.env.NODE_ENV !== 'production';
 const hostname = process.env.HOST || 'localhost';
 const port = parseInt(process.env.PORT || '3000', 10);
 const LOG_DIR = join(process.cwd(), 'logs');
-const DEBUG_LOG_FILE = join(LOG_DIR, 'wterm-poc-debug.log');
 const VERBOSE_LOG = process.env.POC_VERBOSE_LOG === '1';
 const REPLY_IDLE_MS = parseInt(process.env.POC_REPLY_IDLE_MS || '1800', 10);
 const OSC_DEBOUNCE_MS = parseInt(process.env.POC_OSC_DEBOUNCE_MS || '300', 10);
@@ -68,17 +69,10 @@ const OSC_STALE_MS = parseInt(process.env.POC_OSC_STALE_MS || '5000', 10);
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
 const sessionObservers = new Map();
+const logger = createLogger({ logDir: LOG_DIR });
 
 function writeLog(event, data = {}) {
-  const line = JSON.stringify({
-    at: new Date().toISOString(),
-    pid: process.pid,
-    event,
-    ...data,
-  });
-  mkdirSync(LOG_DIR, { recursive: true });
-  appendFileSync(DEBUG_LOG_FILE, `${line}\n`, 'utf-8');
-  console.log(`[POC] ${event}`, data);
+  logger.write(event, data);
 }
 
 function verboseLog(event, data = {}) {
@@ -147,7 +141,8 @@ function observeInput(observer, input) {
       observer.userBuffer = '';
       if (text) {
         observer.hasUserMessage = true;
-        writeLog('user_message', { sessionId: observer.sessionId, text, bytes: Buffer.byteLength(text, 'utf-8') });
+        // 只记录输入字节数，不记录命令正文，避免诊断日志成为敏感数据副本。
+        writeLog('user_message', { sessionId: observer.sessionId, bytes: Buffer.byteLength(text, 'utf-8') });
         observer.terminal?.setHasUserTurn(true);
       }
       continue;
@@ -166,14 +161,42 @@ function observeOutput(observer, output) {
   observer.terminal?.feed(output);
 }
 
+function addObserver(sessionId, observer) {
+  if (!sessionObservers.has(sessionId)) sessionObservers.set(sessionId, new Set());
+  sessionObservers.get(sessionId).add(observer);
+}
+
+function removeObserver(sessionId, observer) {
+  const observers = sessionObservers.get(sessionId);
+  if (!observers) return;
+  observers.delete(observer);
+  if (observers.size === 0) sessionObservers.delete(sessionId);
+}
+
+function parseLastOffset(req) {
+  const query = parse(req.url || '', true).query;
+  const raw = Array.isArray(query.lastOffset) ? query.lastOffset[0] : query.lastOffset;
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw)) return 0n;
+  return BigInt(raw);
+}
+
+function sendTerminalEnvelope(ws, message) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(encodeEnvelope(message));
+}
+
+function sendTerminalOutput(ws, startOffset, payload) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(encodeOutputFrame(startOffset, payload), { binary: true });
+}
+
 app.prepare().then(() => {
-  // 初始化 SQLite 数据库；支持 DATA_DIR 环境变量覆盖（测试用）
+  // 鍒濆鍖?SQLite 鏁版嵁搴擄紱鏀寔 DATA_DIR 鐜鍙橀噺瑕嗙洊锛堟祴璇曠敤锛?
   const dbPath = process.env.DATA_DIR
     ? join(process.env.DATA_DIR, 'nterminal.db')
     : join(process.cwd(), 'data', 'nterminal.db');
   initializeDatabase(dbPath);
+  workspaceService = createWorkspaceService({ db: getDb(), createPty: createSession, closePty: killSession });
 
-  // 首次启动自动发现默认对话源
+  // 首次启动自动发现默认对话源。
   discoverDefaultSources(getDb());
 
   // 创建导入引擎：定时同步（1h）+ fs.watch 文件变更触发
@@ -185,7 +208,7 @@ app.prepare().then(() => {
   // 启动 PTY 清理定时器（30s 扫一次，60s 无连接 kill）
   startSweeper();
 
-  writeLog('server_ready', { dev, hostname, port, cwd: process.cwd(), verboseLog: VERBOSE_LOG, dbPath });
+  writeLog('server_ready', { dev, hostname, port, verboseLog: VERBOSE_LOG });
 
   const server = createServer(async (req, res) => {
     try {
@@ -193,23 +216,15 @@ app.prepare().then(() => {
       verboseLog('http_request', { method: req.method, pathname: parsedUrl.pathname });
 
       if (parsedUrl.pathname.startsWith('/api/')) {
-        // conversation-sources 允许 GET/POST/DELETE
+        if (parsedUrl.pathname === '/api/health') {
+          if (req.method !== 'GET') { errorResponse(res, 405, 'method_not_allowed', '只允许 GET'); return; }
+          const health = getHealthStatus({ getSchemaVersion, getActiveSessions });
+          sendJson(res, health.statusCode, { ok: health.statusCode === 200, data: health.body });
+          return;
+        }
+        // conversation-sources 鍏佽 GET/POST/DELETE
         if (parsedUrl.pathname.startsWith('/api/conversation-sources')) {
           await handleConversationSources(req, res, parsedUrl);
-          return;
-        }
-        // session/list 允许 GET 和 POST
-        if (parsedUrl.pathname === '/api/session/list') {
-          await handleSessionsList(req, res);
-          return;
-        }
-        // session/:id/kill 必须 POST，提前拦截避免掉到 405 分支
-        if (/^\/api\/session\/[^/]+\/kill$/.test(parsedUrl.pathname)) {
-          if (req.method !== 'POST') {
-            errorResponse(res, 405, 'method_not_allowed', '只允许 POST 方法');
-            return;
-          }
-          await handleSessionKill(req, res, parsedUrl);
           return;
         }
         // workspace/tabs 参数化路由（在 switch 之前拦截）
@@ -223,38 +238,32 @@ app.prepare().then(() => {
           await handleTabsCreate(req, res, parsedUrl);
           return;
         }
-        if (/^\/api\/tabs\/[^/]+\/kill$/.test(parsedUrl.pathname)) {
+        if (/^\/api\/tabs\/[^/]+\/(close|delete)$/.test(parsedUrl.pathname)) {
           if (req.method !== 'POST') { errorResponse(res, 405, 'method_not_allowed', '只允许 POST'); return; }
-          await handleTabKill(req, res, parsedUrl);
+          await handleTabCommand(req, res, parsedUrl);
           return;
         }
         if (/^\/api\/workspaces\/[^/]+\/tabs\/[^/]+\/preview$/.test(parsedUrl.pathname)) {
           await handleTabPreview(req, res, parsedUrl);
           return;
         }
-        // 其余 API 只允许 POST
+        // 鍏朵綑 API 鍙厑璁?POST
         if (req.method !== 'POST') {
           errorResponse(res, 405, 'method_not_allowed', '只允许 POST 方法');
           return;
         }
         switch (parsedUrl.pathname) {
-            case '/api/session/create':
-              await handleCreateSession(req, res);
-              return;
             case '/api/directory/validate':
               await handleDirectoryValidate(req, res);
               return;
             case '/api/completion/query':
               await handleCompletionQuery(req, res);
               return;
-            case '/api/records/search':
-              await handleRecordsSearch(req, res);
+            case '/api/history/sessions':
+              await handleHistorySessions(req, res);
               return;
-            case '/api/records/detail':
-              await handleRecordsDetail(req, res);
-              return;
-            case '/api/records/delete':
-              await handleRecordsDelete(req, res);
+            case '/api/history/session':
+              await handleHistorySession(req, res);
               return;
             case '/api/workspaces/list':
               await handleWorkspacesList(req, res);
@@ -280,10 +289,9 @@ app.prepare().then(() => {
         }
         return;
       }
-      writeLog('http_error', { message: err instanceof Error ? err.message : String(err) });
+      writeLog('http_error', { errorCode: err?.code || err?.name || 'HTTP_ERROR' });
       sendJson(res, 500, { ok: false, error: { code: 'internal_error', message: '服务器内部错误' } });
-    }
-  });
+    }  });
 
   const wss = new WebSocketServer({ noServer: true });
 
@@ -318,11 +326,11 @@ app.prepare().then(() => {
   });
 
   wss.on('connection', (ws, req, sessionId) => {
-    bindPtyWebSocket(ws, sessionId);
+    bindPtyWebSocket(ws, sessionId, req);
   });
 
   server.listen(port, hostname, () => {
-    writeLog('server_listen', { url: `http://${hostname}:${port}` });
+    writeLog('server_listen', { hostname, port });
     console.log(`> Ready on http://${hostname}:${port}`);
     // 服务先监听再扫描大型历史目录，避免首次启动长时间无法接受请求。
     setImmediate(() => {
@@ -330,43 +338,14 @@ app.prepare().then(() => {
         .then((results) => {
           writeLog('import_sync_initial', {
             sources: results.length,
-            imported: results.reduce((acc, r) => acc + r.result.importedCount, 0),
-            failed: results.reduce((acc, r) => acc + r.result.failedCount, 0),
+            imported: results.reduce((acc, result) => acc + (result.inserted || 0), 0),
+            failed: results.filter((result) => result.state === 'error').length,
           });
         })
-        .catch((err) => writeLog('import_sync_initial_failed', { message: err instanceof Error ? err.message : String(err) }));
+        .catch((err) => writeLog('import_sync_initial_failed', { errorCode: err?.code || err?.name || 'IMPORT_SYNC_INITIAL_FAILED' }));
     });
   });
 });
-
-async function handleCreateSession(req, res) {
-  const body = await readJsonBody(req);
-  const cwd = body?.cwd;
-  // cwd 可选（缺省用 process.cwd），但传了就必须合法
-  if (cwd !== undefined && cwd !== null) {
-    if (handleValidationError(res, validateCwd(cwd))) return;
-  }
-  // tagLabel 可选字符串，长度上限 200 避免脏数据
-  const tagLabel = typeof body?.tagLabel === 'string' && body.tagLabel.trim() ? body.tagLabel.trim().slice(0, 200) : null;
-  // 标签数量限制：最多 8 个活跃会话（统计要在 create 之前，避免超额时仍然分配了 PTY）
-  if (getActiveSessions().length >= 8) {
-    errorResponse(res, 400, 'session_limit_reached', '最多 8 个活跃标签');
-    return;
-  }
-  const result = createSession({ cwd: cwd || process.cwd(), tagLabel });
-  writeLog('session_created', {
-    id: result.id, status: result.status, command: result.command, cwd: result.cwd,
-    error: result.error || null, tagLabel: result.tagLabel || null,
-  });
-  if (result.status === 'error') {
-    // 失败响应壳统一为 {ok:false, error:{code,message}}，不再附带 data.session
-    errorResponse(res, 500, 'spawn_failed', result.error || '创建 PTY 会话失败');
-    return;
-  }
-  // 创建成功后再取一次 activeSessions，确保响应里包含新建的那一个
-  const activeSessions = getActiveSessions();
-  sendJson(res, 200, { ok: true, data: { session: result, activeSessions } });
-}
 
 async function handleDirectoryValidate(req, res) {
   const body = await readJsonBody(req);
@@ -380,11 +359,11 @@ async function handleDirectoryValidate(req, res) {
   if (handleValidationError(res, validateCwd(value))) return;
   const exists = checkDirectoryExists(value);
   if (!exists.ok) {
-    // checkDirectoryExists 已带 directory_not_found / path_not_directory
+    // checkDirectoryExists 宸插甫 directory_not_found / path_not_directory
     handleValidationError(res, exists);
     return;
   }
-  // 设计 3.4：data = { ok, cwd?, displayName?, error? }
+  // 璁捐 3.4锛歞ata = { ok, cwd?, displayName?, error? }
   sendJson(res, 200, {
     ok: true,
     data: {
@@ -396,7 +375,7 @@ async function handleDirectoryValidate(req, res) {
 }
 
 // ===================== 对话源管理 API =====================
-// 统一处理 /api/conversation-sources 和 /api/conversation-sources/:id/sync
+// 缁熶竴澶勭悊 /api/conversation-sources 鍜?/api/conversation-sources/:id/sync
 
 async function handleConversationSources(req, res, parsedUrl) {
   const pathname = parsedUrl.pathname;
@@ -420,8 +399,8 @@ async function handleConversationSources(req, res, parsedUrl) {
         label: body.label || null,
       });
       sendJson(res, 200, { ok: true, data: r });
-    } catch (err) {
-      errorResponse(res, 500, 'add_failed', err instanceof Error ? err.message : String(err));
+    } catch {
+      errorResponse(res, 500, 'add_failed', '添加对话源失败');
     }
     return;
   }
@@ -431,8 +410,8 @@ async function handleConversationSources(req, res, parsedUrl) {
     try {
       const items = listConversationSources();
       sendJson(res, 200, { ok: true, data: { items } });
-    } catch (err) {
-      errorResponse(res, 500, 'list_failed', err instanceof Error ? err.message : String(err));
+    } catch {
+      errorResponse(res, 500, 'list_failed', '读取对话源失败');
     }
     return;
   }
@@ -449,8 +428,8 @@ async function handleConversationSources(req, res, parsedUrl) {
           return;
         }
         sendJson(res, 200, { ok: true, data: { ok: true } });
-      } catch (err) {
-        errorResponse(res, 500, 'remove_failed', err instanceof Error ? err.message : String(err));
+      } catch {
+        errorResponse(res, 500, 'remove_failed', '删除对话源失败');
       }
       return;
     }
@@ -466,26 +445,19 @@ async function handleConversationSources(req, res, parsedUrl) {
           errorResponse(res, 503, 'engine_not_ready', '导入引擎尚未初始化');
           return;
         }
-        // 设计 C-001：调用引擎执行真实解析，返回真实计数
-        const result = importEngine.syncSource
-          ? await importEngine.syncSource(id)
-          : await importEngine.syncAll().then((rs) => {
-              const found = rs.find((r) => r.sourceId === id);
-              return found ? found.result : { importedCount: 0, skippedCount: 0, failedCount: 1 };
-            });
+        const result = await importEngine.syncSource(id);
         sendJson(res, 200, { ok: true, data: result });
-      } catch (err) {
-        errorResponse(res, 500, 'sync_failed', err instanceof Error ? err.message : String(err));
+      } catch {
+        errorResponse(res, 500, 'sync_failed', '同步对话源失败');
       }
       return;
     }
   }
-
   // 未匹配的路由
   errorResponse(res, 404, 'not_found', `未找到路由 ${pathname}`);
 }
 
-// ===================== 补全查询 API =====================
+// ===================== 琛ュ叏鏌ヨ API =====================
 
 async function handleCompletionQuery(req, res) {
   const body = await readJsonBody(req);
@@ -493,7 +465,7 @@ async function handleCompletionQuery(req, res) {
     errorResponse(res, 400, 'invalid_prefix', 'prefix 必须是非空字符串');
     return;
   }
-  // 设计 C-006：prefix 长度 1-200 字符
+  // 璁捐 C-006锛歱refix 闀垮害 1-200 瀛楃
   if (body.prefix.length > 200) {
     errorResponse(res, 400, 'prefix_too_long', 'prefix 长度不能超过 200 字符');
     return;
@@ -502,106 +474,35 @@ async function handleCompletionQuery(req, res) {
   try {
     const items = dbQueryCompletion(body.prefix, limit);
     sendJson(res, 200, { ok: true, data: { items } });
-  } catch (err) {
-    errorResponse(res, 500, 'query_failed', err instanceof Error ? err.message : String(err));
+  } catch {
+    errorResponse(res, 500, 'query_failed', '查询补全失败');
   }
 }
 
-// 数据库使用蛇形字段名，HTTP 契约统一转换为前端使用的驼峰字段。
-function serializeConversation(row) {
-  return {
-    id: row.id,
-    sourceId: row.source_id,
-    sessionId: row.session_id,
-    role: row.role,
-    content: row.content,
-    toolCalls: row.tool_calls,
-    toolCallId: row.tool_call_id,
-    metadata: row.metadata,
-    userText: row.user_text,
-    endedAt: row.ended_at,
-    createdAt: row.created_at,
-    cwd: row.cwd,
-  };
-}
-
-async function handleRecordsSearch(req, res) {
+async function handleHistorySessions(req, res) {
   const body = await readJsonBody(req);
-  if (handleValidationError(res, validateQuery(body?.query, { required: true }))) return;
-  const limit = Math.min(Math.max(parseInt(body?.limit ?? 20, 10) || 20, 1), 50);
-  const scope = body?.scope === 'user' ? 'user' : 'all';
+  if (handleValidationError(res, validateQuery(body?.query || '*', { required: true }))) return;
   try {
-    const items = searchConversations(body.query, scope, limit).map((item) => ({
-      conversation: serializeConversation(item.conversation),
-      snippet: item.snippet,
-      rank: item.rank,
-    }));
-    sendJson(res, 200, { ok: true, data: { items } });
+    sendJson(res, 200, { ok: true, data: listHistorySessions(body || {}) });
   } catch (err) {
-    errorResponse(res, 500, 'search_failed', err instanceof Error ? err.message : String(err));
-  }
-}
-
-async function handleRecordsDetail(req, res) {
-  const body = await readJsonBody(req);
-  if (typeof body?.recordId !== 'string' || !body.recordId) {
-    errorResponse(res, 400, 'invalid_recordId', 'recordId 必须是非空字符串');
-    return;
-  }
-  const record = getConversationById(body.recordId);
-  if (!record) {
-    errorResponse(res, 404, 'record_not_found', `记录 ${body.recordId} 不存在`);
-    return;
-  }
-  sendJson(res, 200, { ok: true, data: { record: serializeConversation(record) } });
-}
-
-async function handleRecordsDelete(req, res) {
-  const body = await readJsonBody(req);
-  if (typeof body?.recordId !== 'string' || !body.recordId) {
-    errorResponse(res, 400, 'invalid_recordId', 'recordId 必须是非空字符串');
-    return;
-  }
-  sendJson(res, 200, { ok: true, data: { deleted: deleteConversation(body.recordId) } });
-}
-
-// ===================== 会话列表 API =====================
-
-async function handleSessionsList(req, res) {
-  try {
-    const sessions = getActiveSessions();
-    sendJson(res, 200, { ok: true, data: { sessions } });
-  } catch (err) {
-    errorResponse(res, 500, 'list_failed', err instanceof Error ? err.message : String(err));
-  }
-}
-
-// 关闭会话：kill PTY + 从 Map 移除（幂等）
-async function handleSessionKill(req, res, parsedUrl) {
-  try {
-    // 路径形如 /api/session/:id/kill，提取 id
-    const m = parsedUrl.pathname.match(/^\/api\/session\/([^/]+)\/kill$/);
-    const sessionId = m ? m[1] : '';
-    if (!sessionId || sessionId === 'undefined') {
-      errorResponse(res, 400, 'invalid_sessionId', 'sessionId 不能为空');
+    if (err instanceof HistoryServiceError) {
+      errorResponse(res, err.status, err.code, err.message);
       return;
     }
-    // 关闭前先踢掉挂在该 session 上的 WS（避免 zombie observer）
-    const observer = sessionObservers.get(sessionId);
-    if (observer) {
-      try { observer.ws.close(1000, 'session_killed'); } catch { /* ignore */ }
-      sessionObservers.delete(sessionId);
-    }
-    const ok = killSession(sessionId);
-    if (!ok) {
-      // 不存在也算成功（幂等），但记录日志
-      writeLog('session_kill_noop', { sessionId });
-    } else {
-      writeLog('session_killed', { sessionId });
-    }
-    sendJson(res, 200, { ok: true, data: { killed: ok } });
+    errorResponse(res, 500, 'history_sessions_failed', '读取历史会话失败');
+  }
+}
+
+async function handleHistorySession(req, res) {
+  const body = await readJsonBody(req);
+  try {
+    sendJson(res, 200, { ok: true, data: getHistorySession(body || {}) });
   } catch (err) {
-    errorResponse(res, 500, 'kill_failed', err instanceof Error ? err.message : String(err));
+    if (err instanceof HistoryServiceError) {
+      errorResponse(res, err.status, err.code, err.message);
+      return;
+    }
+    errorResponse(res, 500, 'history_session_failed', '读取历史详情失败');
   }
 }
 
@@ -609,37 +510,18 @@ async function handleSessionKill(req, res, parsedUrl) {
 
 async function handleWorkspacesList(req, res) {
   try {
-    const db = getDb();
-    const workspaces = db.prepare('SELECT * FROM workspaces ORDER BY last_active_at DESC').all();
-    sendJson(res, 200, { ok: true, data: workspaces });
-  } catch (err) {
-    errorResponse(res, 500, 'list_workspaces_failed', err instanceof Error ? err.message : String(err));
+    sendJson(res, 200, { ok: true, data: workspaceService.listWorkspaces() });
+  } catch {
+    errorResponse(res, 500, 'list_workspaces_failed', '读取工作区失败');
   }
 }
 
 async function handleWorkspacesCreate(req, res) {
   try {
     const body = await readJsonBody(req);
-    const { cwd, displayName } = body;
-    if (!cwd) {
-      errorResponse(res, 400, 'missing_cwd', '缺少 cwd 参数');
-      return;
-    }
-    const exists = checkDirectoryExists(cwd);
-    if (!exists.ok) {
-      errorResponse(res, 400, 'invalid_cwd', exists.message);
-      return;
-    }
-    const db = getDb();
-    const existing = db.prepare('SELECT id FROM workspaces WHERE id = ?').get(cwd);
-    if (existing) {
-      sendJson(res, 200, { ok: true, data: { id: cwd, created: false } });
-      return;
-    }
-    db.prepare('INSERT INTO workspaces (id, display_name) VALUES (?, ?)').run(cwd, displayName || null);
-    sendJson(res, 200, { ok: true, data: { id: cwd, created: true } });
+    sendJson(res, 200, { ok: true, data: workspaceService.createWorkspace(body || {}) });
   } catch (err) {
-    errorResponse(res, 500, 'create_workspace_failed', err instanceof Error ? err.message : String(err));
+    handleWorkspaceError(res, err, 'create_workspace_failed');
   }
 }
 
@@ -654,90 +536,56 @@ async function handleWorkspacesRename(req, res) {
     const db = getDb();
     db.prepare('UPDATE workspaces SET display_name = ? WHERE id = ?').run(displayName, id);
     sendJson(res, 200, { ok: true });
-  } catch (err) {
-    errorResponse(res, 500, 'rename_workspace_failed', err instanceof Error ? err.message : String(err));
+  } catch {
+    errorResponse(res, 500, 'rename_workspace_failed', '重命名工作区失败');
   }
 }
 
 async function handleWorkspacesDelete(req, res) {
   try {
     const body = await readJsonBody(req);
-    const { id } = body;
-    if (!id) {
-      errorResponse(res, 400, 'missing_id', '缺少 id 参数');
-      return;
-    }
-    const db = getDb();
-    const runningTabs = db.prepare(
-      "SELECT COUNT(*) as cnt FROM tab_sessions WHERE workspace_id = ? AND pty_status = 'running'"
-    ).get(id);
-    if (runningTabs.cnt > 0) {
-      errorResponse(res, 409, 'has_running_tabs', '工作区仍有运行中的标签页');
-      return;
-    }
-    db.prepare('DELETE FROM workspaces WHERE id = ?').run(id);
-    sendJson(res, 200, { ok: true });
+    sendJson(res, 200, { ok: true, data: workspaceService.deleteWorkspace(body?.id, { closeActive: body?.closeActive === true }) });
   } catch (err) {
-    errorResponse(res, 500, 'delete_workspace_failed', err instanceof Error ? err.message : String(err));
+    handleWorkspaceError(res, err, 'delete_workspace_failed');
   }
 }
 
 async function handleTabsList(req, res, parsedUrl) {
   try {
-    const cwd = decodeURIComponent(parsedUrl.pathname.split('/')[3]);
-    const db = getDb();
-    const tabs = db.prepare('SELECT * FROM tab_sessions WHERE workspace_id = ? ORDER BY created_at DESC').all(cwd);
-    sendJson(res, 200, { ok: true, data: tabs });
+    const workspaceId = decodeURIComponent(parsedUrl.pathname.split('/')[3]);
+    sendJson(res, 200, { ok: true, data: workspaceService.listTabs(workspaceId) });
   } catch (err) {
-    errorResponse(res, 500, 'list_tabs_failed', err instanceof Error ? err.message : String(err));
+    handleWorkspaceError(res, err, 'list_tabs_failed');
   }
 }
 
 async function handleTabsCreate(req, res, parsedUrl) {
   try {
-    const cwd = decodeURIComponent(parsedUrl.pathname.split('/')[3]);
+    const workspaceId = decodeURIComponent(parsedUrl.pathname.split('/')[3]);
     const body = await readJsonBody(req).catch(() => ({}));
-    const result = createSession({ cwd, ...body });
-    if (!result.ok) {
-      errorResponse(res, 400, 'pty_create_failed', result.error || '创建终端失败');
-      return;
-    }
-    const db = getDb();
-    const tabId = result.id;
-    const now = new Date().toISOString();
-    db.prepare(
-      "INSERT INTO tab_sessions (id, workspace_id, pty_status, created_at, last_ws_seen_at) VALUES (?, ?, 'running', ?, ?)"
-    ).run(tabId, cwd, now, now);
-    db.prepare(
-      "UPDATE workspaces SET session_count = session_count + 1, last_active_at = ? WHERE id = ?"
-    ).run(now, cwd);
-    sendJson(res, 200, { ok: true, data: { id: tabId, cwd } });
+    sendJson(res, 200, { ok: true, data: workspaceService.createTab(workspaceId, body || {}) });
   } catch (err) {
-    errorResponse(res, 500, 'create_tab_failed', err instanceof Error ? err.message : String(err));
+    handleWorkspaceError(res, err, 'create_tab_failed');
   }
 }
 
-async function handleTabKill(req, res, parsedUrl) {
+async function handleTabCommand(req, res, parsedUrl) {
   try {
     const tabId = decodeURIComponent(parsedUrl.pathname.split('/')[3]);
-    const db = getDb();
-    const tab = db.prepare('SELECT * FROM tab_sessions WHERE id = ?').get(tabId);
-    if (!tab) {
-      errorResponse(res, 404, 'tab_not_found', '标签页不存在');
-      return;
-    }
-    killSession(tabId);
-    const now = new Date().toISOString();
-    db.prepare(
-      "UPDATE tab_sessions SET pty_status = 'ended', killed_at = ? WHERE id = ?"
-    ).run(now, tabId);
-    db.prepare(
-      "UPDATE workspaces SET session_count = MAX(0, session_count - 1) WHERE id = ?"
-    ).run(tab.workspace_id);
-    sendJson(res, 200, { ok: true, data: { killed: true } });
+    const command = parsedUrl.pathname.split('/')[4];
+    const data = command === 'close' ? workspaceService.closeActiveTab(tabId) : workspaceService.deleteTab(tabId);
+    sendJson(res, 200, { ok: true, data });
   } catch (err) {
-    errorResponse(res, 500, 'kill_tab_failed', err instanceof Error ? err.message : String(err));
+    handleWorkspaceError(res, err, 'tab_command_failed');
   }
+}
+
+function handleWorkspaceError(res, err, fallbackCode) {
+  if (err instanceof WorkspaceServiceError) {
+    errorResponse(res, err.status, err.code, err.message);
+    return;
+  }
+  errorResponse(res, 500, fallbackCode, '工作区操作失败');
 }
 
 async function handleTabPreview(req, res, parsedUrl) {
@@ -746,76 +594,101 @@ async function handleTabPreview(req, res, parsedUrl) {
     const tabId = decodeURIComponent(parts[5]); // /api/workspaces/:cwd/tabs/:id/preview
     const preview = getPreview(tabId);
     sendJson(res, 200, { ok: true, data: { preview: preview || '' } });
-  } catch (err) {
-    errorResponse(res, 500, 'preview_failed', err instanceof Error ? err.message : String(err));
+  } catch {
+    errorResponse(res, 500, 'preview_failed', '读取终端预览失败');
   }
 }
 
-function bindPtyWebSocket(ws, sessionId) {
+function bindPtyWebSocket(ws, sessionId, req) {
   writeLog('ws_connected', { sessionId });
   const sessionMeta = getSession(sessionId);
   const observer = createObserver(sessionId, ws, sessionMeta);
-  sessionObservers.set(sessionId, observer);
+  addObserver(sessionId, observer);
+  const liveQueue = [];
+  let snapshotSent = false;
 
   const ptyListener = (event) => {
     if (event.type === 'data') {
-      verboseLog('pty_output_chunk', {
-        sessionId,
-        bytes: Buffer.byteLength(event.data, 'utf-8'),
-        preview: makePreview(event.data, 'output'),
-      });
+      // verbose 日志也只保留大小信息，不能保存终端输出正文。
+      verboseLog('pty_output_chunk', { sessionId, bytes: Buffer.byteLength(event.data, 'utf-8') });
       observeOutput(observer, event.data);
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(Buffer.from(event.data, 'utf-8'));
-      }
+      if (!snapshotSent) liveQueue.push(event);
+      else sendTerminalOutput(ws, event.startOffset, event.payload);
       return;
     }
     if (event.type === 'exit') {
       observer.terminal?.flushNow('pty_exit');
       observer.terminal.dispose();
       writeLog('session_exit', { sessionId, exitCode: event.exitCode, signal: event.signal });
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(`\r\n\x1b[90m[session exited (code ${event.exitCode})]\x1b[0m\r\n`);
-      }
+      sendTerminalEnvelope(ws, { type: 'session_state', state: 'ended', exitCode: event.exitCode, signal: event.signal });
+      return;
+    }
+    if (event.type === 'closed') {
+      observer.terminal?.flushNow('pty_closed');
+      observer.terminal.dispose();
+      sendTerminalEnvelope(ws, { type: 'session_state', state: 'closed', reason: event.reason });
+      ws.close(1000, 'session closed');
     }
   };
 
   addSessionListener(sessionId, ptyListener);
+  const requestedOffset = parseLastOffset(req);
+  const snapshot = getOutputSnapshot(sessionId, requestedOffset);
+  if (!snapshot.ok) {
+    sendTerminalEnvelope(ws, { type: 'error', code: snapshot.error.code, message: snapshot.error.message, oldestOffset: String(snapshot.oldestOffset ?? 0n), currentOffset: String(snapshot.currentOffset ?? 0n) });
+    removeSessionListener(sessionId, ptyListener);
+    removeObserver(sessionId, observer);
+    ws.close(1011, snapshot.error.code);
+    return;
+  }
+  sendTerminalEnvelope(ws, {
+    type: 'hello',
+    session: sessionMeta,
+    snapshotStartOffset: String(snapshot.oldestOffset),
+    currentOffset: String(snapshot.currentOffset),
+  });
+  for (const frame of snapshot.frames) sendTerminalOutput(ws, frame.startOffset, frame.payload);
+  snapshotSent = true;
+  for (const event of liveQueue.splice(0)) {
+    const endOffset = event.startOffset + BigInt(event.byteLength);
+    if (endOffset <= snapshot.currentOffset) continue;
+    if (event.startOffset < snapshot.currentOffset) {
+      const sliceStart = Number(snapshot.currentOffset - event.startOffset);
+      sendTerminalOutput(ws, snapshot.currentOffset, event.payload.subarray(sliceStart));
+      continue;
+    }
+    sendTerminalOutput(ws, event.startOffset, event.payload);
+  }
 
   ws.on('message', async (message, isBinary) => {
     try {
       const input = messageToTerminalInput(message);
-      verboseLog('ws_message', {
-        sessionId, isBinary, bytes: input.bytes,
-        preview: makePreview(input.text, 'user'),
-      });
+      // 终端输入可能包含命令和密钥，日志只记录传输元数据。
+      verboseLog('ws_message', { sessionId, isBinary, bytes: input.bytes });
 
       touchSession(sessionId);
 
-      if (!isBinary && maybeHandleControlMessage(ws, sessionId, input.text)) {
+      if (!isBinary && maybeHandleControlMessage(ws, sessionId, input.text, observer)) {
         return;
       }
 
       observeInput(observer, input.text);
       writeRawInput(ws, sessionId, input.text, input.bytes);
     } catch (err) {
-      writeLog('ws_message_error', { sessionId, message: err instanceof Error ? err.message : String(err) });
+      writeLog('ws_message_error', { sessionId, errorCode: err?.code || err?.name || 'WS_MESSAGE_ERROR' });
     }
   });
 
   ws.on('close', () => {
     observer.terminal?.flushNow('ws_closed');
     observer.terminal.dispose();
-    // 主动 kill PTY 进程并从 sessions Map 删除，避免关页后子进程泄漏
-    try { disposePtySession(sessionId); }
-    catch (err) { writeLog('pty_dispose_failed', { sessionId, message: err instanceof Error ? err.message : String(err) }); }
     writeLog('ws_closed', { sessionId });
     removeSessionListener(sessionId, ptyListener);
-    sessionObservers.delete(sessionId);
+    removeObserver(sessionId, observer);
   });
 
   ws.on('error', (err) => {
-    writeLog('ws_error', { sessionId, message: err instanceof Error ? err.message : String(err) });
+    writeLog('ws_error', { sessionId, errorCode: err?.code || err?.name || 'WS_ERROR' });
   });
 }
 
@@ -827,19 +700,38 @@ function messageToTerminalInput(message) {
   return { text, bytes: Buffer.byteLength(text, 'utf-8') };
 }
 
-function maybeHandleControlMessage(ws, sessionId, text) {
-  let envelope;
+function maybeHandleControlMessage(ws, sessionId, text, observer) {
+  let envelope = null;
   try { envelope = JSON.parse(text); }
   catch { return false; }
   if (!envelope || typeof envelope !== 'object') return false;
+  if (envelope.v === 1) {
+    try { envelope = parseControlEnvelope(text); }
+    catch (err) {
+      sendTerminalEnvelope(ws, { type: 'error', code: err.code || 'BAD_CONTROL_FRAME', message: err.message });
+      ws.close(1002, err.code || 'BAD_CONTROL_FRAME');
+      return true;
+    }
+    if (envelope.type === 'resize') {
+      const ok = resize(sessionId, envelope.cols, envelope.rows);
+      if (ok) {
+        try { observer?.terminal?.resize(envelope.cols, envelope.rows); }
+        catch (err) { writeLog('grid_resize_failed', { sessionId, cols: envelope.cols, rows: envelope.rows, errorCode: err?.code || err?.name || 'GRID_RESIZE_FAILED' }); }
+      }
+      verboseLog('resize', { sessionId, cols: envelope.cols, rows: envelope.rows, ok });
+      if (!ok) writeLog('resize_failed', { sessionId, cols: envelope.cols, rows: envelope.rows });
+      return true;
+    }
+    return false;
+  }
   const ctrl = envelope._ctrl;
   if (!ctrl || typeof ctrl !== 'object') return false;
   if (ctrl.type === 'resize') {
     const ok = resize(sessionId, ctrl.cols, ctrl.rows);
     // P1a：同步 headless grid 尺寸，否则 pi 按真实宽度算的 cursor-up 行数与 grid 错位 → snapshot 乱行。
     if (ok) {
-      try { sessionObservers.get(sessionId)?.terminal?.resize(ctrl.cols, ctrl.rows); }
-      catch (err) { writeLog('grid_resize_failed', { sessionId, cols: ctrl.cols, rows: ctrl.rows, message: err instanceof Error ? err.message : String(err) }); }
+      try { observer?.terminal?.resize(ctrl.cols, ctrl.rows); }
+      catch (err) { writeLog('grid_resize_failed', { sessionId, cols: ctrl.cols, rows: ctrl.rows, errorCode: err?.code || err?.name || 'GRID_RESIZE_FAILED' }); }
     }
     verboseLog('resize', { sessionId, cols: ctrl.cols, rows: ctrl.rows, ok });
     if (!ok) writeLog('resize_failed', { sessionId, cols: ctrl.cols, rows: ctrl.rows });
@@ -851,8 +743,15 @@ function maybeHandleControlMessage(ws, sessionId, text) {
 function writeRawInput(ws, sessionId, input, bytes) {
   const ok = writeToSession(sessionId, input);
   if (!ok) {
-    writeLog('pty_write_failed', { sessionId, bytes, input: makePreview(input, 'user') });
+    writeLog('pty_write_failed', { sessionId, bytes });
   }
 }
+
+
+
+
+
+
+
 
 
