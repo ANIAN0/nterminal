@@ -6,10 +6,15 @@
     "dev": "node server.mjs",
     "build": "next build",
     "start": "cross-env NODE_ENV=production node server.mjs",
-    "lint": "eslint",
-    "test": "npx vitest run",
-    "test:unit": "node --test workplace/1.1/test/backend/unit/text-utils workplace/1.1/test/backend/unit/path-history-store workplace/1.1/test/backend/unit/interaction-recorder workplace/1.1/test/backend/unit/pty-manager",
-    "test:smoke": "node workplace/1.1/test/smoke/e2e-acceptance.mjs"
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:unit": "vitest run test/backend/unit",
+    "test:integration": "vitest run test/backend/integration test/frontend/integration",
+    "test:component": "vitest run test/frontend/component",
+    "test:smoke": "vitest run test/smoke",
+    "test:e2e": "playwright test test/e2e",
+    "test:performance": "playwright test test/performance",
+    "verify": "npm test && npm run lint && npm run build"
   },
   "dependencies": {
     "@streamdown/cjk": "^1.0.3",

@@ -7,11 +7,21 @@ const eslintConfig = defineConfig([
   ...nextTs,
   // Override default ignores of eslint-config-next.
   globalIgnores([
-    // Default ignores of eslint-config-next:
+    // 保留 Next.js 默认排除项，避免检查生成文件。
     ".next/**",
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // 研发文档、历史归档和本地工具产物不属于生产源码质量门禁。
+    "workplace/**",
+    "project-kb/**",
+    "docs/**",
+    ".agents/**",
+    ".claude/**",
+    ".playwright-cli/**",
+    "ui-screenshots/**",
+    "data/**",
+    "logs/**",
   ]),
 ]);
 

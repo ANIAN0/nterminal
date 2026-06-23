@@ -59,8 +59,22 @@ wterm-smoke-server.log
 wterm-submit-smoke.err.log
 wterm-submit-smoke.log
 
-vitest.config.mjs
 skills-lock.json
-workplace
+# workplace 仅保留当前正式版本 1.3；历史版本与归档不入库，避免污染研发边界。
+workplace/1.1
+workplace/1.2
+workplace/archive
+workplace/global
+workplace/test
 .agents
 .claude
+
+# Playwright CLI 调试输出目录（不应入库）
+.playwright-cli/
+
+# Playwright 测试结果与 UI 截图（本地调试产物）
+test-results/
+ui-screenshots/
+
+# 后端源码的临时备份（保留规则：禁止入库）
+server/*.bak.*
