@@ -19,16 +19,6 @@ export interface ErrorResponse {
 
 export type ApiResponse<T> = OkResponse<T> | ErrorResponse;
 
-// ---- Session（设计 3.4 /api/session/create）----
-export interface SessionInfo {
-  id: string;
-  cwd: string;
-  command: string;
-  status: 'running' | 'ended' | 'error';
-  startedAt: string;
-  error?: string | null;
-}
-
 // ---- Directory validate（设计 3.4 /api/directory/validate）----
 export interface ValidateResponse {
   ok: boolean;
@@ -128,9 +118,10 @@ export interface RecordDetailResponse {
 // exited=PTY 已退出（保留只读）, error=PTY 创建/连接失败
 export interface TabInfo {
   id: string;
-  label: string;
-  status: 'connecting' | 'ready' | 'exited' | 'error';
+  label: string | null;
+  status: 'connecting' | 'ready' | 'running' | 'ended' | 'exited' | 'error';
   cwd?: string;
+  workspaceId?: string;
 }
 
 // 与后端 session_limit_reached=8 对齐：最多 8 个活跃标签
@@ -139,10 +130,10 @@ export const MAX_TABS = 8;
 // ---- Workspace（工作区）----
 export interface Workspace {
   id: string;
-  display_name: string | null;
-  created_at: string;
-  last_active_at: string | null;
-  session_count: number;
+  displayName: string | null;
+  createdAt: string;
+  lastActiveAt: string | null;
+  sessionCount: number;
 }
 
 // ---- Completion（补全项）----
@@ -159,6 +150,11 @@ export interface ConversationSource {
   agentType: 'claude' | 'pi' | 'codex' | 'opencode';
   label: string | null;
   lastSyncedAt: string | null;
+  lastSuccessAt?: string | null;
+  lastErrorCode?: string | null;
+  lastErrorMessage?: string | null;
+  lastErrorAt?: string | null;
+  syncState?: 'idle' | 'active' | 'syncing' | 'error' | string;
   recordCount: number;
   status: 'active' | 'paused' | 'error';
 }
@@ -183,6 +179,83 @@ export interface ConversationSearchItem {
   conversation: ConversationRecord;
   snippet: string | null;
   rank: number;
+}
+
+export interface HistorySourceState {
+  sourceId: string;
+  agentType: 'claude' | 'pi' | 'codex' | 'opencode';
+  label: string | null;
+  path: string;
+  state: 'active' | 'paused' | 'error';
+  syncState?: string;
+  recordCount?: number;
+  lastSyncedAt?: string | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  errorAt?: string | null;
+}
+
+export interface HistorySessionSummary {
+  sessionKey: string;
+  sourceId: string;
+  nativeSessionId: string | null;
+  cwd: string | null;
+  title: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  sourceFile?: string | null;
+  messageCount: number;
+  snippet: string | null;
+}
+
+export interface HistoryWorkspaceGroup {
+  cwd: string;
+  displayName: string;
+  sessions: HistorySessionSummary[];
+}
+
+export interface HistorySourceGroup {
+  sourceId: string;
+  agentType: 'claude' | 'pi' | 'codex' | 'opencode';
+  label: string | null;
+  state: 'active' | 'paused' | 'error';
+  workspaces: HistoryWorkspaceGroup[];
+}
+
+export interface HistorySessionsResponse {
+  groups: HistorySourceGroup[];
+  pagination: {
+    limit: number;
+    hasMore: boolean;
+    searchMode: 'all' | 'like' | 'fts';
+    nextCursor: string | null;
+  };
+  sourceStates: HistorySourceState[];
+}
+
+export interface HistoryMessage {
+  id: string;
+  sourceId: string;
+  sessionId: string | null;
+  sessionKey: string;
+  nativeMessageId: string | null;
+  messageIndex: number;
+  role: 'user' | 'assistant' | 'system' | 'tool';
+  content: string | null;
+  toolCalls: string | null;
+  toolCallId: string | null;
+  metadata: string | null;
+  userText: string | null;
+  endedAt: string | null;
+  createdAt: string;
+  cwd: string | null;
+  sourceFile: string | null;
+}
+
+export interface HistorySessionDetailResponse {
+  session: HistorySessionSummary;
+  source: HistorySourceState;
+  messages: HistoryMessage[];
 }
 
 // ---- API 请求/响应类型 ----

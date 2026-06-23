@@ -4,13 +4,12 @@
  */
 
 import type {
-  SessionInfo,
   ValidateResponse,
   ConversationSource,
   CompletionQueryResponse,
   Workspace,
-  ConversationRecord,
-  ConversationSearchItem,
+  HistorySessionDetailResponse,
+  HistorySessionsResponse,
 } from './types';
 
 export class ApiError extends Error {
@@ -99,16 +98,6 @@ async function getJson<T>(path: string, options: { signal?: AbortSignal } = {}):
   return parsed.data as T;
 }
 
-// createSession 响应壳（C-005）：{ session, activeSessions }，不再直接是 SessionInfo
-export interface CreateSessionResponse {
-  session: SessionInfo;
-  activeSessions: SessionInfo[];
-}
-
-export function createSession(body: { cwd: string; cols?: number; rows?: number; tagLabel?: string }, options?: { signal?: AbortSignal }): Promise<CreateSessionResponse> {
-  return postJson<CreateSessionResponse>('/api/session/create', body, options);
-}
-
 export function validateDirectory(body: { path: string }, options?: { signal?: AbortSignal }): Promise<ValidateResponse> {
   return postJson<ValidateResponse>('/api/directory/validate', body, options);
 }
@@ -119,12 +108,28 @@ export function listWorkspaces(options?: { signal?: AbortSignal }): Promise<Work
   return postJson<Workspace[]>('/api/workspaces/list', {}, options);
 }
 
-export function createWorkspace(body: { cwd: string; displayName?: string }, options?: { signal?: AbortSignal }): Promise<{ id: string; created: boolean }> {
-  return postJson<{ id: string; created: boolean }>('/api/workspaces/create', body, options);
+export function createWorkspace(body: { cwd: string; displayName?: string; requestId: string }, options?: { signal?: AbortSignal }): Promise<{ workspace: Workspace; deduplicated: boolean }> {
+  return postJson('/api/workspaces/create', body, options);
 }
 
-export function deleteWorkspace(body: { id: string }, options?: { signal?: AbortSignal }): Promise<{ ok: true }> {
-  return postJson<{ ok: true }>('/api/workspaces/delete', body, options);
+export function deleteWorkspace(body: { id: string; closeActive?: boolean }, options?: { signal?: AbortSignal }): Promise<{ deleted: boolean; closedTabs: number }> {
+  return postJson('/api/workspaces/delete', body, options);
+}
+
+export function listTabs(workspaceId: string, options?: { signal?: AbortSignal }): Promise<import('./types').TabInfo[]> {
+  return postJson(`/api/workspaces/${encodeURIComponent(workspaceId)}/tabs/list`, {}, options);
+}
+
+export function createTab(workspaceId: string, body: { requestId: string; label?: string }, options?: { signal?: AbortSignal }) {
+  return postJson<{ tab: import('./types').TabInfo; deduplicated: boolean }>(`/api/workspaces/${encodeURIComponent(workspaceId)}/tabs/create`, body, options);
+}
+
+export function closeTab(id: string, options?: { signal?: AbortSignal }) {
+  return postJson<{ closed: boolean }>(`/api/tabs/${encodeURIComponent(id)}/close`, {}, options);
+}
+
+export function deleteTab(id: string, options?: { signal?: AbortSignal }) {
+  return postJson<{ deleted: boolean }>(`/api/tabs/${encodeURIComponent(id)}/delete`, {}, options);
 }
 
 export function previewTab(workspaceCwd: string, tabId: string, options?: { signal?: AbortSignal }): Promise<{ preview: string }> {
@@ -171,9 +176,12 @@ export async function removeConversationSource(id: string, options?: { signal?: 
 
 // sync 返回的 data 直接是 { importedCount, skippedCount, failedCount }，postJson 已解包 ok 外壳
 export interface SyncResult {
-  importedCount: number;
-  skippedCount: number;
-  failedCount: number;
+  sourceId: string;
+  state: 'active' | 'error';
+  inserted: number;
+  updated: number;
+  deleted: number;
+  skipped?: boolean;
 }
 
 export function syncConversationSource(id: string, options?: { signal?: AbortSignal }): Promise<SyncResult> {
@@ -186,44 +194,31 @@ export function queryCompletion(body: { prefix: string; limit?: number }, option
   return postJson<CompletionQueryResponse>('/api/completion/query', body, options);
 }
 
-// ---- 会话列表 ----
-
-export function listSessions(options?: { signal?: AbortSignal }): Promise<{ sessions: SessionInfo[] }> {
-  return postJson<{ sessions: SessionInfo[] }>('/api/session/list', {}, options);
+export function listHistorySessions(body: { query?: string; limit?: number }, options?: { signal?: AbortSignal }): Promise<HistorySessionsResponse> {
+  return postJson<HistorySessionsResponse>('/api/history/sessions', body, options);
 }
 
-// 关闭会话：调后端 kill PTY + 移除 session
-export function killSession(id: string, options?: { signal?: AbortSignal }): Promise<{ killed: boolean }> {
-  return postJson<{ killed: boolean }>(`/api/session/${encodeURIComponent(id)}/kill`, {}, options);
-}
-
-export function searchRecords(body: { query: string; limit?: number; scope?: string }, options?: { signal?: AbortSignal }): Promise<{ items: ConversationSearchItem[] }> {
-  return postJson<{ items: ConversationSearchItem[] }>('/api/records/search', body, options);
-}
-
-export function getRecordDetail(body: { recordId: string }, options?: { signal?: AbortSignal }): Promise<{ record: ConversationRecord }> {
-  return postJson<{ record: ConversationRecord }>('/api/records/detail', body, options);
-}
-
-export function deleteRecord(body: { recordId: string }, options?: { signal?: AbortSignal }): Promise<{ ok: true; deleted: boolean }> {
-  return postJson<{ ok: true; deleted: boolean }>('/api/records/delete', body, options);
+export function getHistorySession(body: { sourceId: string; sessionKey: string }, options?: { signal?: AbortSignal }): Promise<HistorySessionDetailResponse> {
+  return postJson<HistorySessionDetailResponse>('/api/history/session', body, options);
 }
 
 export const api = {
-  createSession,
   validateDirectory,
   listWorkspaces,
   createWorkspace,
   deleteWorkspace,
+  listTabs,
+  createTab,
+  closeTab,
+  deleteTab,
   previewTab,
-  searchRecords,
   addConversationSource,
   listConversationSources,
   removeConversationSource,
   syncConversationSource,
   queryCompletion,
-  listSessions,
-  killSession,
+  listHistorySessions,
+  getHistorySession,
 };
 
 export default api;
