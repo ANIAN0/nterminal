@@ -61,6 +61,10 @@ export function initializeDatabase(dbPath) {
   try {
     db = new Database(dbPath);
     db.pragma('journal_mode = WAL');
+    // 与 worker 线程保持一致：写锁最多等待 5 秒。同步主线程会在 worker 跑
+    // replaceSourceData 大事务的同时写 conversation_sources.sync_state / last_error_*，
+    // 没有 busy_timeout 会让主线程立即抛出 SQLITE_BUSY，进而变成 unhandledRejection。
+    db.pragma('busy_timeout = 5000');
     migrateDatabase(db);
     db.pragma('foreign_keys = ON');
     return db;

@@ -205,6 +205,7 @@ function updateSourceError(db, sourceId, error, now) {
 export async function performJsonlSourceSync(db, source) {
   const failedFiles = [];
   const parsedByFile = new Map();
+  let unrecognizedFailures = 0;
   try {
     const sourceStat = statSync(source.path);
     const files = sourceStat.isDirectory() ? listJsonlFiles(source.path) : [source.path];
@@ -217,13 +218,26 @@ export async function performJsonlSourceSync(db, source) {
       } catch (error) {
         const classified = classifySourceError(error);
         failedFiles.push({ filePath, code: classified.code });
-        if (source.needs_reconcile) throw classified;
+        // "无法识别对话文件格式" 意味着该 JSONL 不是 Agent 会话（如 fixtures/全局索引），
+        // 不应阻断其它文件入库；needs_reconcile 首次全量也只跳过、不抛。
+        const unrecognized = classified.code === 'PARSE_ERROR'
+          && /无法识别对话文件格式/.test(classified.message);
+        if (unrecognized) unrecognizedFailures += 1;
+        if (source.needs_reconcile && !unrecognized) throw classified;
       }
     }
     const counts = replaceSourceData(db, source, parsedByFile, scannedFiles);
     const messageCount = db.prepare('SELECT COUNT(*) AS count FROM conversations WHERE source_id = ?').get(source.id).count;
     const now = new Date().toISOString();
     if (failedFiles.length > 0) {
+      // 全部失败都是"无法识别对话文件格式"且至少有一个文件成功入库时，
+      // 这些 JSONL 是混入目录的 fixtures / 全局索引，不应让 source 整体标 error。
+      const onlyUnrecognized = unrecognizedFailures === failedFiles.length;
+      const hasSuccessfulInsert = parsedByFile.size > 0 && messageCount > 0;
+      if (onlyUnrecognized && hasSuccessfulInsert) {
+        updateSourceSuccess(db, source.id, messageCount, now);
+        return { sourceId: source.id, state: 'active', ...counts, updated: 0, failedFiles, lastSuccessAt: now };
+      }
       const partial = new SourceSyncError('PARSE_ERROR', '部分对话文件同步失败', true);
       updateSourceError(db, source.id, partial, now);
       return { sourceId: source.id, state: 'error', ...counts, updated: 0, failedFiles, error: { code: partial.code, message: partial.message, retryable: partial.retryable, contextId: partial.contextId } };
@@ -294,7 +308,18 @@ export function createImportEngine({ db } = {}) {
     } catch (error) {
       const classified = classifySourceError(error);
       const now = new Date().toISOString();
-      updateSourceError(db, sourceId, classified, now);
+      // updateSourceError 自身也可能因 db 锁竞争抛 SQLITE_BUSY（worker 大事务期间主线程争用）。
+      // 这种二次失败不应再冒泡成 unhandledRejection；降级为 console.error，让 syncSource 仍能返回 error 结果。
+      try {
+        updateSourceError(db, sourceId, classified, now);
+      } catch (secondary) {
+        console.error('[conversation-import] updateSourceError failed after primary error', {
+          sourceId,
+          primaryCode: classified.code,
+          secondaryCode: secondary?.code,
+          secondaryMessage: secondary instanceof Error ? secondary.message : String(secondary),
+        });
+      }
       return {
         sourceId,
         state: 'error',
