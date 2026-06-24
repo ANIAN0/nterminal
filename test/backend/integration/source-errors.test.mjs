@@ -37,7 +37,12 @@ describe('来源错误隔离与恢复', () => {
     cpSync(piFixture, join(goodDir, 'session.jsonl'));
     cpSync(piFixture, join(badDir, 'session.jsonl'));
     const badFile = join(badDir, 'broken.jsonl');
-    writeFileSync(badFile, '{invalid-json');
+    // broken.jsonl 是合法 JSON 且首行能被识别为 pi 会话,
+    // 但内部消息使用不支持的 role, 触发真正的解析错误, 应当让 source 标 error。
+    writeFileSync(badFile, [
+      JSON.stringify({ type: 'session', version: 3, id: 'broken', cwd: 'H:/fixture', timestamp: '2026-01-01T00:00:00.000Z' }),
+      JSON.stringify({ type: 'message', message: { role: 'alien', content: 'bad' } }),
+    ].join('\n'));
     initializeDatabase(join(tempDir, 'nterminal.db'));
     const good = insertConversationSource({ path: goodDir, agentType: 'pi' });
     const bad = insertConversationSource({ path: badDir, agentType: 'pi' });

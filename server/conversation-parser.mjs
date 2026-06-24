@@ -40,6 +40,28 @@ const metadataParsers = new Map([
 
 // ===================== 格式检测 =====================
 
+// CLAUDE_BRANCH_META_TYPES：Claude Code 在每个会话文件首部写入的元数据行，
+// 这些行不含消息正文，但只要它们出现在文件里就足以判定该文件属于 Claude 会话。
+const CLAUDE_BRANCH_META_TYPES = new Set([
+  'last-prompt',
+  'queue-operation',
+  'mode',
+  'attachment',
+  'summary',
+  'save-context',
+  'ai-title',
+  'user-prompt-submit',
+  'stop_hook_summary',
+  'permission-mode',
+  'file-history-snapshot',
+  'hook_progress',
+  'hook_response',
+]);
+
+// CODEX_INDEX_KEYS：Codex 全局索引（session_index.jsonl）使用的字段组合，
+// 没有 message 内容，是 Agent 自身的查找表，不属于单个会话文件，应在解析前跳过。
+const CODEX_INDEX_KEYS = ['id', 'thread_name', 'updated_at'];
+
 /**
  * SQLite 文件头魔数（前 16 字节中的 ASCII 字符串 "SQLite format 3\0"）。
  * @param {string} filePath - 文件路径
@@ -80,6 +102,10 @@ function readFirstLineJson(filePath) {
  *      - 含 `display` + `project` → 'claude'
  *      - `type: "session"` + `version: 3` → 'pi'
  *      - `type: "session_meta"` → 'codex'
+ *      - `type` 属于 Claude 会话元数据行（last-prompt/queue-operation/mode 等） → 'claude'
+ *      - `id` + `thread_name` + `updated_at` → 'codex'（Codex 全局索引）
+ *      - 含 `type` + `message.role` → 'claude'
+ *      - 含 `type` + `message.role` + `parentId` → 'pi'
  *   3. 无法识别 → null
  *
  * @param {string} filePath - 文件路径
@@ -110,14 +136,32 @@ export function detectFormat(filePath) {
     return 'codex';
   }
 
-  // 6. Claude Code 会话文件：含 type + message.role（非 session/session_meta）
+  // 6. Claude Code 元数据行（last-prompt/queue-operation/mode 等）：仅凭首行 type 即可识别该文件属于 Claude 会话，
+  //    claude-parser 会跳过这些非消息条目，只解析 user/assistant/tool 行。
+  if (typeof firstLine.type === 'string' && CLAUDE_BRANCH_META_TYPES.has(firstLine.type)) {
+    return 'claude';
+  }
+
+  // 7. Codex 全局索引（session_index.jsonl）：id + thread_name + updated_at 三字段共现即视为索引文件，
+  //    它不是单个会话的 JSONL，应在导入阶段跳过而不是按会话解析。
+  if (CODEX_INDEX_KEYS.every((key) => firstLine[key] !== undefined) && !firstLine.type) {
+    return 'codex';
+  }
+
+  // 8. Claude Code 会话文件：含 type + message.role（非 session/session_meta）
   if (firstLine.type && firstLine.message && firstLine.message.role) {
     return 'claude';
   }
 
-  // 7. pi-mono 会话树 entry：含 type + message.role + parentId
+  // 9. pi-mono 会话树 entry：含 type + message.role + parentId
   if (firstLine.type && firstLine.message && firstLine.message.role && firstLine.parentId !== undefined) {
     return 'pi';
+  }
+
+  // 10. Claude Code 会话兜底：首行含 sessionId（且不是已识别的其它 Agent 类型），
+  //     视为 Claude session，由 parseSessionFile 进一步过滤 message 行。
+  if (typeof firstLine.sessionId === 'string' && firstLine.sessionId.length > 0) {
+    return 'claude';
   }
 
   // 无法识别
