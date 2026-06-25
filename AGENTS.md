@@ -136,3 +136,21 @@ npx playwright-cli attach --cdp=http://127.0.0.1:9222
 - 优先连接现有浏览器，而非启动新实例。
 - 这样可以复用用户的登录状态、书签和扩展。
 - 适用于自动化测试、网页抓取、UI 调试等场景。
+
+## 12. 测试规范
+
+**测试文件位置：** 所有测试文件只能放在 `workplace/` 目录下，按版本/阶段归类（如 `workplace/1.4/test/`、`workplace/1.4/<task>/test/`）。**禁止在项目根目录、源码目录或其他位置创建测试文件。**
+
+**测试栈：** 单元测试、集成测试、验收测试统一使用 **pytest**。禁止引入 Vitest、Playwright、jest、mocha 等其他测试运行器到项目正式测试中。
+
+**环境隔离：** 测试必须运行在**独立虚拟环境**中，**严禁污染项目根 `node_modules`、`package.json` 或 Python 系统环境**：
+- 使用 `uv venv` 在 `workplace/<version>/.venv/` 下创建虚拟环境。
+- 使用 `uv pip install` 或 `uv add`（在 `workplace/<version>/pyproject.toml`）安装 pytest 及依赖。
+- 虚拟环境目录（如 `.venv/`）必须通过 `.gitignore` 忽略，不入库。
+- 不允许把 pytest 及其依赖写入项目根 `package.json` 或根 `requirements.txt`。
+
+**测试产物：** 测试运行产物（截图、报告、覆盖率、临时数据库）必须输出到 `workplace/<version>/test-artifacts/` 之类的工作区子目录，禁止写入项目根或源码目录。
+
+**新增测试前：** 先在 `workplace/<version>/` 下规划任务文档（需求/方案/任务），确认要验证的缺口，再写最小可复现的 pytest 用例。
+
+**Why：** 把测试与生产代码在物理上隔离，避免测试套件膨胀污染项目结构、依赖、CI 时间与构建边界；pytest + uv venv 是经过验证的轻量、确定性、跨平台方案。

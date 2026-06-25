@@ -4,7 +4,7 @@
 
 - 先读取 [项目知识库](project-kb/index.md) 和待修改文件对应的 [代码知识](project-kb/code/index.md)。
 - 当前正式研发版本为 `1.3`；`workplace/1.1`、`workplace/1.2` 和归档仅作为历史证据，不作为源码或测试入口。
-- 生产前端位于 `app/`，服务端入口为 `server.mjs`，服务模块位于 `server/`，正式测试位于根 `test/`。
+- 生产前端位于 `app/`，服务端入口为 `server.mjs`，服务模块位于 `server/`。项目根目录不再保留任何测试入口；所有测试按 `AGENTS.md` 第 12 条统一放在 `workplace/<version>/...` 下、使用 pytest + uv 独立 venv。
 - 保留工作树中不属于当前任务的改动；禁止修改真实 `data/`、`logs/` 和外部 Agent 数据库。
 
 ## 实现约束
@@ -17,9 +17,9 @@
 
 ## 验证命令
 
-- `npm test`：运行根 `test/` 下的正式 Vitest 测试。
-- `npm run lint`：检查当前生产源码、配置和根测试，不检查研发文档与历史归档。
+- `npm run lint`：检查当前生产源码和配置，不检查研发文档与历史归档。
 - `npm run build`：执行 Next.js 生产构建。
-- `npm run verify`：串行执行 test、lint 和 build。
+- `npm run verify`：串行执行 lint 和 build。
+- pytest 用例：在对应 `workplace/<version>/...` 目录下用 `uv run pytest` 执行；不得在项目根运行。
 
-浏览器主流程和性能验证由 Playwright 任务补齐；在对应脚本落地前不得用 build 代替功能验收。
+浏览器主流程和性能验证由 workplace 下的 pytest 任务补齐；在对应脚本落地前不得用 build 代替功能验收。
